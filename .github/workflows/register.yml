@@ -1,4 +1,4 @@
-name: OpenAI Auto Register
+name: Daily Task Job
 
 on:
   schedule:
@@ -35,7 +35,7 @@ jobs:
           mkdir -p codex
           for i in $(seq 1 $REG_COUNT); do
             echo "========== 第 $i/$REG_COUNT 次注册 =========="
-            python openai_register.py --once || true
+            python task_runner.py --once || true
             if [ "$i" -lt "$REG_COUNT" ]; then
               SLEEP=$((RANDOM % 20 + 10))
               echo "[*] 等待 ${SLEEP}s..."
@@ -69,9 +69,9 @@ jobs:
               EMAIL=$(python3 -c "import json; d=json.load(open('$f')); print(d.get('email','?'))" 2>/dev/null || echo "?")
               echo "  ✅ $EMAIL"
             done)
-            MSG="🤖 *OpenAI Auto Register*%0A%0A🎉 成功注册 ${COUNT} 个账号:%0A${FILES}%0A%0ARun: [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+            MSG="🤖 *Daily Task Job*%0A%0A🎉 成功获取 ${COUNT} 个结果:%0A${FILES}%0A%0ARun: [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
           else
-            MSG="🤖 *OpenAI Auto Register*%0A%0A❌ 本次运行未注册成功%0A%0ARun: [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+            MSG="🤖 *Daily Task Job*%0A%0A❌ 本次无产出%0A%0ARun: [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
           fi
 
           curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
