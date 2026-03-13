@@ -30,7 +30,7 @@ jobs:
 
       - name: Run registration
         env:
-          REG_COUNT: ${{ github.event.inputs.count || '5' }}
+          REG_COUNT: ${{ github.event.inputs.count || '40' }}
         run: |
           mkdir -p codex
           for i in $(seq 1 $REG_COUNT); do
