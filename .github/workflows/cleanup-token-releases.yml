@@ -23,8 +23,8 @@ jobs:
           cutoff_epoch=$(date -u -d "${KEEP_HOURS} hours ago" +%s)
           echo "Cutoff epoch (delete if created_at < cutoff): $cutoff_epoch"
 
-          gh api "repos/${REPO}/releases?per_page=100" --paginate \
-            --jq '.[] | [.tag_name, .created_at] | @tsv' -r |
+          gh api "repos/${REPO}/releases?per_page=100" --paginate |
+            jq -r '.[] | [.tag_name, .created_at] | @tsv' |
           while IFS=$'\t' read -r tag created_at; do
             case "$tag" in
               tokens-*)
