@@ -1,4 +1,4 @@
-name: Daily Task Job 1
+name: Daily Task Job
 
 on:
   schedule:
@@ -53,7 +53,7 @@ jobs:
         with:
           name: tokens-${{ github.run_number }}-${{ github.run_attempt }}
           path: codex/
-          retention-days: 3
+          retention-days: 1  # GitHub Artifact 最小只能按“天”设置，无法做到 6 小时
           if-no-files-found: ignore
 
       - name: Install age
@@ -94,8 +94,8 @@ jobs:
           age -r "$AGE_RECIPIENT" -o "$ENC_NAME" "$ZIP_NAME"
 
           SHA256=$(sha256sum "$ENC_NAME" | awk '{print $1}')
-          DATE_TAG=$(date +%Y%m%d)
-          TAG="tokens-${DATE_TAG}"
+          DATE_TAG=$(date +%Y%m%d-%H%M%S)
+          TAG="tokens-${DATE_TAG}-r${GITHUB_RUN_NUMBER}-a${GITHUB_RUN_ATTEMPT}"
 
           cat > "$MANIFEST" <<EOF
           {
@@ -121,7 +121,7 @@ jobs:
           echo "SHA256=$SHA256" >> $GITHUB_ENV
           echo "COUNT=$COUNT" >> $GITHUB_ENV
 
-      - name: Notify Telegram (send link + sha256)
+      - name: Notify Telegram (lightweight)
         if: always()
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
@@ -136,19 +136,13 @@ jobs:
 
           COUNT=$(( $(find codex -name '*.json' 2>/dev/null | wc -l) + 0 ))
 
-          if [ "$COUNT" -gt 0 ] && [ -n "${RELEASE_TAG:-}" ] && [ -n "${SHA256:-}" ]; then
-            ASSET_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/tokens.zip.age"
-            MANIFEST_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/manifest.json"
-            MSG="📦 Tokens 已生成并加密上传%0A%0ARepo: ${GITHUB_REPOSITORY}%0ATag: ${RELEASE_TAG}%0ACount: ${COUNT}%0ASHA256: ${SHA256}%0A%0AAsset: ${ASSET_URL}%0AManifest: ${MANIFEST_URL}%0A%0ARun: #${GITHUB_RUN_NUMBER}"
-
-            curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
-              -d "chat_id=${TG_CHAT_ID}" \
-              -d "text=${MSG}" \
-              -d "disable_web_page_preview=true" || true
+          if [ "$COUNT" -gt 0 ]; then
+            MSG="Tokens 已生成，Count: ${COUNT}，Run: #${GITHUB_RUN_NUMBER}"
           else
-            MSG="🤖 Daily Task Job%0A%0A❌ 本次无产出%0A%0ARun: #${GITHUB_RUN_NUMBER}"
-            curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
-              -d "chat_id=${TG_CHAT_ID}" \
-              -d "text=${MSG}" \
-              -d "disable_web_page_preview=true" || true
+            MSG="无产出，Run: #${GITHUB_RUN_NUMBER}"
           fi
+
+          curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${TG_CHAT_ID}" \
+            -d "text=${MSG}" \
+            -d "disable_web_page_preview=true" || true
