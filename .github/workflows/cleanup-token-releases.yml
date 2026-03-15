@@ -1,8 +1,8 @@
-name: Cleanup old token releases (keep 3 days)
+name: Cleanup old token releases (keep 6 hours)
 
 on:
   schedule:
-    - cron: "25 0 * * *"
+    - cron: "*/15 * * * *"  # 每 15 分钟清一次
   workflow_dispatch:
 
 permissions:
@@ -12,26 +12,27 @@ jobs:
   cleanup:
     runs-on: ubuntu-latest
     steps:
-      - name: Delete token releases older than 3 days
+      - name: Delete token releases older than 6 hours
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          KEEP_DAYS: 3
+          KEEP_HOURS: 6
         run: |
           set -euo pipefail
 
-          # keep today + previous 2 days
-          CUTOFF=$(date -u -d "$((KEEP_DAYS-1)) days ago" +%Y%m%d)
-          echo "Cutoff (keep >=): $CUTOFF"
+          cutoff_epoch=$(date -u -d "${KEEP_HOURS} hours ago" +%s)
+          echo "Cutoff epoch (delete if created_at < cutoff): $cutoff_epoch"
 
           gh api "repos/${REPO}/releases?per_page=100" --paginate \
-            --jq '.[] | .tag_name' -r |
-          while read -r tag; do
-            if [[ "$tag" =~ ^tokens-([0-9]{8})$ ]]; then
-              d="${BASH_REMATCH[1]}"
-              if [[ "$d" < "$CUTOFF" ]]; then
-                echo "Deleting old token release: $tag"
-                gh release delete "$tag" -y
-              fi
-            fi
+            --jq '.[] | [.tag_name, .created_at] | @tsv' -r |
+          while IFS=$'\t' read -r tag created_at; do
+            case "$tag" in
+              tokens-*)
+                created_epoch=$(date -u -d "$created_at" +%s)
+                if [ "$created_epoch" -lt "$cutoff_epoch" ]; then
+                  echo "Deleting old token release: $tag (created_at=$created_at)"
+                  gh release delete "$tag" -y
+                fi
+                ;;
+            esac
           done
