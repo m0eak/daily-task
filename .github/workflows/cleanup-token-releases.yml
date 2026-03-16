@@ -2,7 +2,7 @@ name: Cleanup old token releases (keep 6 hours)
 
 on:
   schedule:
-    - cron: "*/59 * * * *"  # 每 15 分钟清一次
+    - cron: "*/59 * * * *"  # 每小时清一次
   workflow_dispatch:
 
 permissions:
@@ -31,7 +31,7 @@ jobs:
                 created_epoch=$(date -u -d "$created_at" +%s)
                 if [ "$created_epoch" -lt "$cutoff_epoch" ]; then
                   echo "Deleting old token release: $tag (created_at=$created_at)"
-                  gh release delete "$tag" -y
+                  gh release delete "$tag" -y -R "$REPO"
                 fi
                 ;;
             esac
