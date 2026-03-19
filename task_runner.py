@@ -23,42 +23,178 @@ import imaplib
 import email as email_lib
 
 from curl_cffi import requests
+from rich.console import Console
+from rich.panel import Panel
+from rich.live import Live
+from rich.table import Table
 
 # ==========================================
 # Mail.tm 临时邮箱 API
 # ==========================================
 
 MAILTM_BASE = "https://api.mail.tm"
-DUCKMAIL_BASE = "https://api.duckmail.sbs"
+console = Console()
+
+
+@dataclass
+class UIState:
+    started_at: datetime
+    total_count: int = 0
+    success_count: int = 0
+    failed_count: int = 0
+    current_round: int = 0
+    current_round_logs: Optional[List[str]] = None
+    saved_files: Optional[List[str]] = None
+
+    def __post_init__(self) -> None:
+        if self.current_round_logs is None:
+            self.current_round_logs = []
+        if self.saved_files is None:
+            self.saved_files = []
+
+
+ui_state: Optional[UIState] = None
+ui_live: Optional[Live] = None
+
+
+def _duration_text() -> str:
+    if not ui_state:
+        return "00:00:00"
+    elapsed = int((datetime.now() - ui_state.started_at).total_seconds())
+    h = elapsed // 3600
+    m = (elapsed % 3600) // 60
+    s = elapsed % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def _render_dashboard() -> Table:
+    if not ui_state:
+        table = Table.grid(padding=(0, 1))
+        table.add_row(
+            Panel(
+                "[cyan]初始化中...[/cyan]",
+                title="[bold bright_cyan]状态[/bold bright_cyan]",
+                border_style="bright_cyan",
+            )
+        )
+        return table
+
+    summary = Table.grid(expand=True)
+    summary.add_column(justify="left")
+    summary.add_column(justify="left")
+    summary.add_row("[bold]启动时间[/bold]", f"[bright_white]{ui_state.started_at.strftime('%Y-%m-%d %H:%M:%S')}[/bright_white]")
+    summary.add_row("[bold]运行时长[/bold]", f"[bright_white]{_duration_text()}[/bright_white]")
+    summary.add_row(
+        "[bold]成功/总数/失败[/bold]",
+        f"[bold green]{ui_state.success_count}[/bold green] / [bold bright_cyan]{ui_state.total_count}[/bold bright_cyan] / [bold red]{ui_state.failed_count}[/bold red]",
+    )
+
+    saved_files = ui_state.saved_files or []
+    round_logs = ui_state.current_round_logs or []
+    recent_files = saved_files[-8:]
+    files_lines = [
+        f"{idx}. {os.path.basename(path)}" for idx, path in enumerate(recent_files, start=1)
+    ]
+    files_text = "\n".join(files_lines) or "暂无写入文件"
+    logs_text = "\n".join(round_logs[-16:]) or "当前轮次暂无日志"
+
+    left_column = Table.grid(expand=True)
+    left_column.add_column(ratio=1)
+    left_column.add_row(
+        Panel(
+            summary,
+            title="[bold bright_cyan]运行概览[/bold bright_cyan]",
+            border_style="bright_cyan",
+        )
+    )
+    left_column.add_row(
+        Panel(
+            files_text,
+            title="[bold bright_green]写入文件列表[/bold bright_green]",
+            border_style="bright_green",
+        )
+    )
+
+    right_column = Panel(
+        logs_text,
+        title=f"[bold bright_magenta]当前轮次 #{ui_state.current_round} 输出[/bold bright_magenta]",
+        border_style="bright_magenta",
+    )
+
+    root = Table.grid(expand=True)
+    root.add_column(ratio=2)
+    root.add_column(ratio=3)
+    root.add_row(left_column, right_column)
+    return root
+
+
+def _refresh_ui() -> None:
+    if ui_live is not None:
+        ui_live.update(_render_dashboard())
+
+
+def _append_round_log(msg: str) -> None:
+    if ui_state is not None:
+        if ui_state.current_round_logs is None:
+            ui_state.current_round_logs = []
+        ui_state.current_round_logs.append(msg)
+        if len(ui_state.current_round_logs) > 200:
+            ui_state.current_round_logs = ui_state.current_round_logs[-200:]
+    _refresh_ui()
 
 
 def log_info(msg: str, *, end: str = "\n", flush: bool = False) -> None:
-    print(f"[*] {msg}", end=end, flush=flush)
+    if ui_live is None:
+        console.print(f"[bold cyan][*][/bold cyan] {msg}", end=end)
+        return
+    if end == "":
+        _append_round_log(f"[cyan]{msg}[/cyan]")
+        return
+    _append_round_log(f"[cyan][*][/cyan] {msg}")
 
 
 def log_success(msg: str, *, end: str = "\n", flush: bool = False) -> None:
-    print(f"[✓] {msg}", end=end, flush=flush)
+    if ui_live is None:
+        console.print(f"[bold green][✓][/bold green] {msg}", end=end)
+        return
+    _append_round_log(f"[green][✓][/green] {msg}")
 
 
 def log_error(msg: str, *, end: str = "\n", flush: bool = False) -> None:
-    print(f"[Error] {msg}", end=end, flush=flush)
+    if ui_live is None:
+        console.print(f"[bold red][Error][/bold red] {msg}", end=end)
+        return
+    _append_round_log(f"[red][Error][/red] {msg}")
 
 
 def log_plain(msg: str, *, end: str = "\n", flush: bool = False) -> None:
-    print(msg, end=end, flush=flush)
+    if ui_live is None:
+        console.print(msg, end=end, markup=False)
+        return
+    if end == "":
+        if ui_state is not None and ui_state.current_round_logs:
+            ui_state.current_round_logs[-1] = ui_state.current_round_logs[-1] + msg
+            _refresh_ui()
+            return
+    _append_round_log(msg)
 
 
 def log_panel(title: str, msg: str, *, border_style: str = "cyan") -> None:
-    print(f"--- {title} ---")
-    print(msg)
-    print("-" * len(title))
+    if ui_live is None:
+        console.print(Panel(msg, title=title, border_style=border_style))
+        return
+    _append_round_log(f"{title}")
+    for line in msg.splitlines():
+        _append_round_log(f"  {line}")
 
 
 def log_error_detail(msg: str) -> None:
-    print("--- 错误详情 ---")
-    print(msg)
-    print("----------------")
-
+    if ui_live is None:
+        log_panel("[bold red]错误详情[/bold red]", msg, border_style="red")
+        return
+    _append_round_log("[red]错误详情:[/red]")
+    for line in msg.splitlines():
+        _append_round_log(line)
 
 
 def _mailtm_headers(*, token: str = "", use_json: bool = False) -> Dict[str, str]:
@@ -146,7 +282,7 @@ def get_email_dropmail(proxies: Any = None) -> tuple[str, str]:
     return "", ""
 
 def get_oai_code_dropmail(session_id: str, email: str, proxies: Any = None) -> str:
-    """使用 Dropmail Session 获取验证码"""
+    """使用 Dropmail Session 获取 OpenAI 验证码"""
     query = """
     query ($id: ID!) {
         session(id: $id) {
@@ -240,7 +376,7 @@ def get_email_1secmail(proxies: Any = None) -> tuple[str, str]:
     return email, "1secmail"
 
 def get_oai_code_1secmail(email: str, proxies: Any = None) -> str:
-    """使用 1secmail 邮箱轮询获取验证码"""
+    """使用 1secmail 邮箱轮询获取 OpenAI 验证码"""
     login, domain = email.split("@")
     url_list = f"https://www.1secmail.com/api/v1/?action=getMessages&login={login}&domain={domain}"
     regex = r"(?<!\d)(\d{6})(?!\d)"
@@ -339,7 +475,7 @@ def get_email_temp_mailfree(proxies: Any = None) -> tuple[str, str]:
     return "", ""
 
 def get_oai_code_temp_mailfree(email: str, token: str, proxies: Any = None) -> str:
-    """使用 Temp-Mailfree 获取验证码"""
+    """使用 Temp-Mailfree 获取 OpenAI 验证码"""
     import urllib.request
     import json
     
@@ -450,7 +586,7 @@ def get_email_and_token(proxies: Any = None, base_url: str = MAILTM_BASE) -> tup
 
 
 def get_oai_code(token: str, email: str, proxies: Any = None, base_url: str = MAILTM_BASE) -> str:
-    """使用 Mail.tm 或 Mail.gw Token 轮询获取验证码"""
+    """使用 Mail.tm 或 Mail.gw Token 轮询获取 OpenAI 验证码"""
     url_list = f"{base_url}/messages"
     regex = r"(?<!\d)(\d{6})(?!\d)"
     seen_ids: set[str] = set()
@@ -539,7 +675,7 @@ def get_email_imap(domain: str) -> str:
     return f"{local}@{domain}"
 
 def get_oai_code_imap(target_email: str, imap_server: str, imap_user: str, imap_pass: str) -> str:
-    """IMAP 获取验证码"""
+    """IMAP 获取 OpenAI 邮件验证码"""
     regex = r"(?<!\d)(\d{6})(?!\d)"
     log_info(f"正在等待 IMAP 邮箱 {target_email} 的验证码...", end="")
     
@@ -843,6 +979,8 @@ def submit_callback_url(
 
 
 def run(proxy: Optional[str], imap_config: Optional[dict] = None, email_provider: str = "mailgw") -> Optional[str]:
+    ui_state.failed_count = getattr(ui_state, "failed_count", 0)
+
     # 自动修补 Proxy 协议缺失
     if proxy and "://" not in proxy:
         if proxy.endswith(":1080"):
@@ -898,11 +1036,6 @@ def run(proxy: Optional[str], imap_config: Optional[dict] = None, email_provider
         if not email or not dev_token:
             return None
         log_info(f"成功获取 Mail.tm 邮箱与授权: {email}")
-    elif email_provider == "duckmail":
-        email, dev_token = get_email_and_token(proxies, base_url=DUCKMAIL_BASE)
-        if not email or not dev_token:
-            return None
-        log_info(f"成功获取 DuckMail 邮箱与授权: {email}")
     elif email_provider == "tempmailfree":
         email, dev_token = get_email_temp_mailfree(proxies)
         if not email or not dev_token:
@@ -1026,8 +1159,6 @@ def run(proxy: Optional[str], imap_config: Optional[dict] = None, email_provider
             code = get_oai_code(dev_token, email, proxies, base_url="https://api.mail.gw")
         elif email_provider == "tempmailfree":
             code = get_oai_code_temp_mailfree(email, dev_token, proxies)
-        elif email_provider == "duckmail":
-            code = get_oai_code(dev_token, email, proxies, base_url=DUCKMAIL_BASE)
         else:
             code = get_oai_code(dev_token, email, proxies)
             
@@ -1156,6 +1287,8 @@ def run(proxy: Optional[str], imap_config: Optional[dict] = None, email_provider
 
 
 def main() -> None:
+    global ui_state, ui_live
+
     parser = argparse.ArgumentParser(description="OpenAI 自动注册脚本")
     parser.add_argument(
         "--proxy", default=None, help="代理地址，如 http://127.0.0.1:7890"
@@ -1170,8 +1303,8 @@ def main() -> None:
     )
     # 临时邮箱服务商
     parser.add_argument(
-        "--email-provider", choices=["dropmail", "mailgw", "mailtm", "1secmail", "tempmailfree", "duckmail"], default="duckmail", 
-        help="使用的临时邮箱 API 提供商，默认为 duckmail"
+        "--email-provider", choices=["dropmail", "mailgw", "mailtm", "1secmail", "tempmailfree"], default="dropmail", 
+        help="使用的临时邮箱 API 提供商，默认为 dropmail"
     )
     # IMAP Catch-All Arguments
     parser.add_argument("--imap-domain", help="IMAP 域名 (如 example.com)")
@@ -1195,58 +1328,70 @@ def main() -> None:
     output_dir = args.output_dir or "codex"
     os.makedirs(output_dir, exist_ok=True)
 
-    started_at = datetime.now()
-    total_count = 0
-    success_count = 0
-    failed_count = 0
+    ui_state = UIState(started_at=datetime.now())
+    is_ci = not sys.stdout.isatty() or os.getenv("CI") == "true"
+    
+    from contextlib import nullcontext
+    ctx = nullcontext() if is_ci else Live(_render_dashboard(), console=console, screen=True, refresh_per_second=4)
 
-    print("OpenAI Auto Registrar 已启动 (简洁模式)")
+    with ctx as live:
+        ui_live = None if is_ci else live
+        
+        if ui_live:
+            _append_round_log("[bold cyan]OpenAI Auto Registrar 已启动[/bold cyan]")
+        else:
+            console.print("[bold cyan]OpenAI Auto Registrar 已启动 (CLI 模式)[/bold cyan]")
 
-    while True:
-        total_count += 1
-        current_round = total_count
+        while True:
+            ui_state.total_count += 1
+            ui_state.current_round = ui_state.total_count
+            ui_state.current_round_logs = []
 
-        try:
-            log_panel(
-                f"开始第 {current_round} 次注册流程",
-                f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-                border_style="bright_magenta",
-            )
-            token_json = run(args.proxy, imap_config=imap_config, email_provider=args.email_provider)
-
-            if token_json:
-                try:
-                    t_data = json.loads(token_json)
-                    fname_email = t_data.get("email", "unknown").replace("@", "_")
-                except Exception:
-                    fname_email = "unknown"
-
-                file_name = os.path.join(
-                    output_dir, f"token_{fname_email}_{int(time.time())}.json"
+            try:
+                log_panel(
+                    f"开始第 {ui_state.current_round} 次注册流程",
+                    f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                    border_style="bright_magenta",
                 )
+                token_json = run(args.proxy, imap_config=imap_config, email_provider=args.email_provider)
 
-                with open(file_name, "w", encoding="utf-8") as f:
-                    f.write(token_json)
+                if token_json:
+                    try:
+                        t_data = json.loads(token_json)
+                        fname_email = t_data.get("email", "unknown").replace("@", "_")
+                    except Exception:
+                        fname_email = "unknown"
 
-                success_count += 1
-                log_success(f"注册成功，Token 已保存: {file_name}")
-            else:
-                failed_count += 1
-                log_error("本次注册失败，未产出 token")
+                    file_name = os.path.join(
+                        output_dir, f"token_{fname_email}_{int(time.time())}.json"
+                    )
 
-        except Exception as e:
-            failed_count += 1
-            log_error(f"发生未捕获异常: {e}")
+                    with open(file_name, "w", encoding="utf-8") as f:
+                        f.write(token_json)
 
-        elapsed = datetime.now() - started_at
-        print(f"统计: 成功 {success_count} / 总数 {total_count} / 失败 {failed_count} | 耗时: {elapsed}")
+                    ui_state.success_count += 1
+                    if ui_state.saved_files is None:
+                        ui_state.saved_files = []
+                    ui_state.saved_files.append(file_name)
+                    if len(ui_state.saved_files) > 100:
+                        ui_state.saved_files = ui_state.saved_files[-100:]
+                    log_success(f"注册成功，Token 已保存: {file_name}")
+                else:
+                    ui_state.failed_count += 1
+                    log_error("本次注册失败，未产出 token")
 
-        if args.once:
-            break
+            except Exception as e:
+                ui_state.failed_count += 1
+                log_error(f"发生未捕获异常: {e}")
 
-        wait_time = random.randint(sleep_min, sleep_max)
-        log_info(f"休息 {wait_time} 秒...")
-        time.sleep(wait_time)
+            if args.once:
+                break
+
+            wait_time = random.randint(sleep_min, sleep_max)
+            log_info(f"休息 {wait_time} 秒...")
+            time.sleep(wait_time)
+
+        ui_live = None
 
 
 if __name__ == "__main__":
