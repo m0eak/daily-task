@@ -62,10 +62,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y age
 
-      - name: Package + Encrypt + Upload Release asset
+      - name: Package + (Optional) Encrypt + Upload Release asset
         if: always()
         env:
           AGE_RECIPIENT: ${{ secrets.AGE_RECIPIENT }}
+          ALLOW_PLAINTEXT_RELEASE: ${{ secrets.ALLOW_PLAINTEXT_RELEASE }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -79,21 +80,31 @@ jobs:
             exit 0
           fi
 
-          if [ -z "${AGE_RECIPIENT:-}" ]; then
-            echo "Missing repo variable AGE_RECIPIENT (age public key)."
-            exit 1
-          fi
-
           ZIP_NAME="tokens.zip"
-          ENC_NAME="tokens.zip.age"
           MANIFEST="manifest.json"
 
-          rm -f "$ZIP_NAME" "$ENC_NAME" "$MANIFEST"
+          rm -f "$ZIP_NAME" "$MANIFEST" tokens.zip.age
           zip -r "$ZIP_NAME" codex/*.json
 
-          age -r "$AGE_RECIPIENT" -o "$ENC_NAME" "$ZIP_NAME"
+          # Decide whether to encrypt
+          ENCRYPTED=false
+          ASSET_NAME="tokens.zip"
 
-          SHA256=$(sha256sum "$ENC_NAME" | awk '{print $1}')
+          if [ -n "${AGE_RECIPIENT:-}" ]; then
+            ENCRYPTED=true
+            ASSET_NAME="tokens.zip.age"
+            age -r "$AGE_RECIPIENT" -o "$ASSET_NAME" "$ZIP_NAME"
+          else
+            echo "AGE_RECIPIENT not set: will NOT encrypt."
+            echo "WARNING: uploading plaintext tokens.zip to a GitHub Release is dangerous on public repos."
+            if [ "${ALLOW_PLAINTEXT_RELEASE:-}" != "true" ]; then
+              echo "Skip release upload. To force plaintext upload, set secret ALLOW_PLAINTEXT_RELEASE=true."
+              exit 0
+            fi
+            mv "$ZIP_NAME" "$ASSET_NAME"
+          fi
+
+          SHA256=$(sha256sum "$ASSET_NAME" | awk '{print $1}')
           DATE_TAG=$(date +%Y%m%d-%H%M%S)
           TAG="tokens-${DATE_TAG}-r${GITHUB_RUN_NUMBER}-a${GITHUB_RUN_ATTEMPT}"
 
@@ -102,26 +113,78 @@ jobs:
             "tag": "${TAG}",
             "sha256": "${SHA256}",
             "count": ${COUNT},
+            "encrypted": ${ENCRYPTED},
+            "asset_name": "${ASSET_NAME}",
             "generated_at": "$(date -Is)"
           }
           EOF
 
+          create_release() {
+            local attempt
+            for attempt in 1 2 3; do
+              echo "[*] gh release create attempt ${attempt}/3 for ${TAG}"
+              if gh release create "$TAG" \
+                --title "Tokens ${DATE_TAG}" \
+                --notes "Token bundle (encrypted=${ENCRYPTED})." \
+                --latest=false; then
+                return 0
+              fi
+              echo "[!] gh release create failed (attempt ${attempt}). Sleeping..."
+              sleep $((attempt * 5))
+            done
+            return 1
+          }
+
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "Release exists: $TAG"
           else
-            gh release create "$TAG" \
-              --title "Tokens ${DATE_TAG}" \
-              --notes "Encrypted token bundle (assets are age-encrypted)." \
-              --latest=false
+            # Important: gh may have created the git tag even if release creation fails.
+            # We must verify release existence explicitly, otherwise we end up with "tag only".
+            create_release
           fi
 
-          gh release upload "$TAG" "$ENC_NAME" "$MANIFEST" --clobber
+          # Verify release really exists (not just a tag)
+          RELEASE_URL=$(gh release view "$TAG" --json url --jq '.url' 2>/dev/null || true)
+          if [ -z "${RELEASE_URL:-}" ]; then
+            echo "ERROR: Release verification failed for tag=$TAG (tag may exist, but release object missing)."
+            echo "Tip: check GitHub API /rate limits / permissions; this job will fail so we notice."
+            exit 1
+          fi
+          echo "Release verified: ${RELEASE_URL}"
+
+          # Upload assets (with retries) and verify assets exist on the release.
+          upload_assets() {
+            local attempt
+            for attempt in 1 2 3; do
+              echo "[*] gh release upload attempt ${attempt}/3"
+              if gh release upload "$TAG" "$ASSET_NAME" "$MANIFEST" --clobber; then
+                return 0
+              fi
+              echo "[!] gh release upload failed (attempt ${attempt}). Sleeping..."
+              sleep $((attempt * 5))
+            done
+            return 1
+          }
+
+          upload_assets
+
+          ASSETS=$(gh release view "$TAG" --json assets --jq '.assets[].name' 2>/dev/null || true)
+          echo "Assets on release:"; echo "$ASSETS" | sed -n '1,200p'
+
+          echo "$ASSETS" | grep -qx "$ASSET_NAME" || { echo "ERROR: missing asset: $ASSET_NAME"; exit 1; }
+          echo "$ASSETS" | grep -qx "$MANIFEST"  || { echo "ERROR: missing asset: $MANIFEST"; exit 1; }
 
           echo "RELEASE_TAG=$TAG" >> $GITHUB_ENV
+          echo "RELEASE_URL=$RELEASE_URL" >> $GITHUB_ENV
           echo "SHA256=$SHA256" >> $GITHUB_ENV
           echo "COUNT=$COUNT" >> $GITHUB_ENV
+          echo "ASSET_NAME=$ASSET_NAME" >> $GITHUB_ENV
 
-      - name: Notify Telegram (lightweight)
+          # Keep the old final output format (tag URL) for compatibility,
+          # but also output the verified release URL so we can debug quickly.
+          echo "${RELEASE_URL}"
+          echo "https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
+      - name: Notify Telegram (lightweight, optional)
         if: always()
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
@@ -137,12 +200,12 @@ jobs:
           COUNT=$(( $(find codex -name '*.json' 2>/dev/null | wc -l) + 0 ))
 
           if [ "$COUNT" -gt 0 ]; then
-            MSG="Tokens 已生成，Count: ${COUNT}，Run: #${GITHUB_RUN_NUMBER}"
+            MSG="Tokens generated, Count: ${COUNT}, Run: #${GITHUB_RUN_NUMBER}"
           else
-            MSG="无产出，Run: #${GITHUB_RUN_NUMBER}"
+            MSG="No output, Run: #${GITHUB_RUN_NUMBER}"
           fi
 
           curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
-            -d "chat_id=${TG_CHAT_ID}" \
-            -d "text=${MSG}" \
-            -d "disable_web_page_preview=true" || true
+            --data-urlencode "chat_id=${TG_CHAT_ID}" \
+            --data-urlencode "text=${MSG}" \
+            --data-urlencode "disable_web_page_preview=true" >/dev/null || true

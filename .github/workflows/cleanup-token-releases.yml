@@ -2,7 +2,7 @@ name: Cleanup old token releases (keep 6 hours)
 
 on:
   schedule:
-    - cron: "*/59 * * * *"  # 每小时清一次
+    - cron: "0 */8 * * *"  # 每小时清一次
   workflow_dispatch:
 
 permissions:
@@ -16,7 +16,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          KEEP_HOURS: 6
+          KEEP_HOURS: 48
         run: |
           set -euo pipefail
 
