@@ -35,6 +35,9 @@ jobs:
       - name: Run registration
         env:
           REG_COUNT: ${{ github.event.inputs.count || '40' }}
+          DEFAULT_WORKER_URL: ${{ secrets.DEFAULT_WORKER_URL }}
+          DEFAULT_MF_USER: ${{ secrets.DEFAULT_MF_USER }}
+          DEFAULT_MF_PASS: ${{ secrets.DEFAULT_MF_PASS }}
         run: |
           mkdir -p codex
           for i in $(seq 1 $REG_COUNT); do
