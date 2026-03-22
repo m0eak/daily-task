@@ -1,3 +1,4 @@
+from __future__ import annotations
 import json
 import os
 import re
@@ -11,6 +12,8 @@ import secrets
 import hashlib
 import base64
 import threading
+import queue
+import html
 import argparse
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse, parse_qs, urlencode, quote
@@ -23,178 +26,84 @@ import imaplib
 import email as email_lib
 
 from curl_cffi import requests
-from rich.console import Console
-from rich.panel import Panel
-from rich.live import Live
-from rich.table import Table
 
 # ==========================================
 # Mail.tm 临时邮箱 API
 # ==========================================
 
 MAILTM_BASE = "https://api.mail.tm"
-console = Console()
+DUCKMAIL_BASE = "https://api.duckmail.sbs"
+DEFAULT_WORKER_URL = os.environ["DEFAULT_WORKER_URL"]
+DEFAULT_MF_USER = os.environ["DEFAULT_MF_USER"]
+DEFAULT_MF_PASS = os.environ["DEFAULT_MF_PASS"]
 
 
-@dataclass
-class UIState:
-    started_at: datetime
-    total_count: int = 0
-    success_count: int = 0
-    failed_count: int = 0
-    current_round: int = 0
-    current_round_logs: Optional[List[str]] = None
-    saved_files: Optional[List[str]] = None
+LOG_INFO_ALLOW_PREFIXES = (
+    "Sentinel状态:",
+    "提交注册表单状态:",
+    "注册密码状态:",
+    "验证码校验状态:",
+    "账户创建状态:",
+    "恢复登录密码提交状态:",
+    "OTP 校验状态:",
+)
 
-    def __post_init__(self) -> None:
-        if self.current_round_logs is None:
-            self.current_round_logs = []
-        if self.saved_files is None:
-            self.saved_files = []
-
-
-ui_state: Optional[UIState] = None
-ui_live: Optional[Live] = None
-
-
-def _duration_text() -> str:
-    if not ui_state:
-        return "00:00:00"
-    elapsed = int((datetime.now() - ui_state.started_at).total_seconds())
-    h = elapsed // 3600
-    m = (elapsed % 3600) // 60
-    s = elapsed % 60
-    return f"{h:02d}:{m:02d}:{s:02d}"
-
-
-def _render_dashboard() -> Table:
-    if not ui_state:
-        table = Table.grid(padding=(0, 1))
-        table.add_row(
-            Panel(
-                "[cyan]初始化中...[/cyan]",
-                title="[bold bright_cyan]状态[/bold bright_cyan]",
-                border_style="bright_cyan",
-            )
-        )
-        return table
-
-    summary = Table.grid(expand=True)
-    summary.add_column(justify="left")
-    summary.add_column(justify="left")
-    summary.add_row("[bold]启动时间[/bold]", f"[bright_white]{ui_state.started_at.strftime('%Y-%m-%d %H:%M:%S')}[/bright_white]")
-    summary.add_row("[bold]运行时长[/bold]", f"[bright_white]{_duration_text()}[/bright_white]")
-    summary.add_row(
-        "[bold]成功/总数/失败[/bold]",
-        f"[bold green]{ui_state.success_count}[/bold green] / [bold bright_cyan]{ui_state.total_count}[/bold bright_cyan] / [bold red]{ui_state.failed_count}[/bold red]",
-    )
-
-    saved_files = ui_state.saved_files or []
-    round_logs = ui_state.current_round_logs or []
-    recent_files = saved_files[-8:]
-    files_lines = [
-        f"{idx}. {os.path.basename(path)}" for idx, path in enumerate(recent_files, start=1)
-    ]
-    files_text = "\n".join(files_lines) or "暂无写入文件"
-    logs_text = "\n".join(round_logs[-16:]) or "当前轮次暂无日志"
-
-    left_column = Table.grid(expand=True)
-    left_column.add_column(ratio=1)
-    left_column.add_row(
-        Panel(
-            summary,
-            title="[bold bright_cyan]运行概览[/bold bright_cyan]",
-            border_style="bright_cyan",
-        )
-    )
-    left_column.add_row(
-        Panel(
-            files_text,
-            title="[bold bright_green]写入文件列表[/bold bright_green]",
-            border_style="bright_green",
-        )
-    )
-
-    right_column = Panel(
-        logs_text,
-        title=f"[bold bright_magenta]当前轮次 #{ui_state.current_round} 输出[/bold bright_magenta]",
-        border_style="bright_magenta",
-    )
-
-    root = Table.grid(expand=True)
-    root.add_column(ratio=2)
-    root.add_column(ratio=3)
-    root.add_row(left_column, right_column)
-    return root
-
-
-def _refresh_ui() -> None:
-    if ui_live is not None:
-        ui_live.update(_render_dashboard())
-
-
-def _append_round_log(msg: str) -> None:
-    if ui_state is not None:
-        if ui_state.current_round_logs is None:
-            ui_state.current_round_logs = []
-        ui_state.current_round_logs.append(msg)
-        if len(ui_state.current_round_logs) > 200:
-            ui_state.current_round_logs = ui_state.current_round_logs[-200:]
-    _refresh_ui()
+LOG_ERROR_ALLOW_PREFIXES = (
+    "Sentinel 异常拦截",
+    "恢复登录 Sentinel 请求失败",
+    "恢复登录 authorize/continue 失败",
+    "恢复登录密码提交失败",
+    "恢复登录发送第二次 OTP 失败",
+    "恢复登录未获取到新的第二次 OTP",
+    "恢复登录第二次 OTP 校验失败",
+    "恢复登录流程仍未解析到 workspace_id",
+    "恢复登录 workspace/select 失败",
+    "恢复登录 workspace/select 响应里缺少 continue_url",
+    "恢复登录流程未能在重定向链中捕获 callback/token",
+    "恢复登录流程未在超时内取得 token",
+    "注册响应",
+    "发送验证码失败",
+    "验证失败",
+    "未能解析 workspace_id",
+    "选择 workspace 失败",
+    "workspace/select 响应里缺少 continue_url",
+    "未能在重定向链中捕获到最终 Callback URL",
+    "本次注册失败，未产出 token",
+    "发生未捕获异常",
+    "网络连接检查失败",
+    "未知的邮箱提供商",
+    "运行时发生错误",
+)
 
 
 def log_info(msg: str, *, end: str = "\n", flush: bool = False) -> None:
-    if ui_live is None:
-        console.print(f"[bold cyan][*][/bold cyan] {msg}", end=end)
-        return
-    if end == "":
-        _append_round_log(f"[cyan]{msg}[/cyan]")
-        return
-    _append_round_log(f"[cyan][*][/cyan] {msg}")
+    if msg.startswith(LOG_INFO_ALLOW_PREFIXES):
+        print(f"[*] {msg}", end=end, flush=flush)
 
 
 def log_success(msg: str, *, end: str = "\n", flush: bool = False) -> None:
-    if ui_live is None:
-        console.print(f"[bold green][✓][/bold green] {msg}", end=end)
-        return
-    _append_round_log(f"[green][✓][/green] {msg}")
+    if msg.startswith("注册成功，Token 已保存:"):
+        print(f"[✓] {msg}", end=end, flush=flush)
 
 
 def log_error(msg: str, *, end: str = "\n", flush: bool = False) -> None:
-    if ui_live is None:
-        console.print(f"[bold red][Error][/bold red] {msg}", end=end)
-        return
-    _append_round_log(f"[red][Error][/red] {msg}")
+    if msg.startswith(LOG_ERROR_ALLOW_PREFIXES):
+        print(f"[Error] {msg}", end=end, flush=flush)
 
 
 def log_plain(msg: str, *, end: str = "\n", flush: bool = False) -> None:
-    if ui_live is None:
-        console.print(msg, end=end, markup=False)
-        return
-    if end == "":
-        if ui_state is not None and ui_state.current_round_logs:
-            ui_state.current_round_logs[-1] = ui_state.current_round_logs[-1] + msg
-            _refresh_ui()
-            return
-    _append_round_log(msg)
+    return None
 
 
 def log_panel(title: str, msg: str, *, border_style: str = "cyan") -> None:
-    if ui_live is None:
-        console.print(Panel(msg, title=title, border_style=border_style))
-        return
-    _append_round_log(f"{title}")
-    for line in msg.splitlines():
-        _append_round_log(f"  {line}")
+    return None
 
 
 def log_error_detail(msg: str) -> None:
-    if ui_live is None:
-        log_panel("[bold red]错误详情[/bold red]", msg, border_style="red")
-        return
-    _append_round_log("[red]错误详情:[/red]")
-    for line in msg.splitlines():
-        _append_round_log(line)
+    print("--- 错误详情 ---")
+    print(msg)
+    print("----------------")
+
 
 
 def _mailtm_headers(*, token: str = "", use_json: bool = False) -> Dict[str, str]:
@@ -204,6 +113,107 @@ def _mailtm_headers(*, token: str = "", use_json: bool = False) -> Dict[str, str
     if token:
         headers["Authorization"] = f"Bearer {token}"
     return headers
+
+
+def _mailfree_login(base_url: str, username: str, password: str, proxies=None):
+    s = requests.Session(proxies=proxies, impersonate="chrome")
+    resp = s.post(
+        f"{base_url}/api/login",
+        json={"username": username, "password": password},
+        timeout=15,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"Mailfree 登录失败: HTTP {resp.status_code} {resp.text[:200]}")
+    return s
+
+
+def get_domain_email(proxies=None, base_url=DEFAULT_WORKER_URL, mf_user=DEFAULT_MF_USER, mf_pass=DEFAULT_MF_PASS):
+    try:
+        s = _mailfree_login(base_url, mf_user, mf_pass, proxies)
+        resp = s.get(f"{base_url}/api/generate", timeout=15)
+        if resp.status_code == 200:
+            data = resp.json()
+            addr = ""
+            if isinstance(data, dict):
+                addr = data.get("address") or data.get("email") or ""
+            if addr:
+                log_info(f"Mailfree 创建邮箱成功: {addr}")
+                return addr, s
+            log_error(f"Mailfree generate 响应格式未知: {resp.text[:300]}")
+        else:
+            log_error(f"Mailfree generate 失败: HTTP {resp.status_code} {resp.text[:200]}")
+    except Exception as e:
+        log_error(f"Mailfree 创建邮箱异常: {e}")
+    return "", None
+
+
+def get_oai_code_domain(email_addr: str, mf_session=None, proxies=None, base_url=DEFAULT_WORKER_URL, mf_user=DEFAULT_MF_USER, mf_pass=DEFAULT_MF_PASS) -> str:
+    regex = r"(?<!\d)(\d{6})(?!\d)"
+    log_info(f"正在等待 Mailfree 邮箱 {email_addr} 的验证码...", end='')
+    seen_ids: set[str] = set()
+
+    if mf_session is not None:
+        s = mf_session
+    else:
+        try:
+            s = _mailfree_login(base_url, mf_user, mf_pass, proxies)
+        except Exception as e:
+            log_error(f"Mailfree 登录失败，无法轮询邮件: {e}")
+            return ""
+
+    for _ in range(40):
+        log_plain(".", end="")
+        try:
+            resp = s.get(f"{base_url}/api/emails", params={"mailbox": email_addr, "limit": 20}, timeout=15)
+            if resp.status_code != 200:
+                time.sleep(3)
+                continue
+
+            messages = resp.json()
+            if isinstance(messages, dict):
+                messages = messages.get("list") or messages.get("data") or messages.get("emails") or []
+            if not isinstance(messages, list):
+                messages = []
+
+            for msg in messages:
+                if not isinstance(msg, dict):
+                    continue
+                msg_id = str(msg.get("id") or msg.get("_id") or "").strip()
+                if not msg_id or msg_id in seen_ids:
+                    continue
+                seen_ids.add(msg_id)
+
+                detail_resp = s.get(f"{base_url}/api/email/{msg_id}", timeout=15)
+                if detail_resp.status_code != 200:
+                    continue
+
+                mail_raw = detail_resp.json()
+                mail_data = mail_raw.get("data") if (isinstance(mail_raw, dict) and "data" in mail_raw) else mail_raw
+                if not isinstance(mail_data, dict):
+                    continue
+
+                sender = str(mail_data.get("from") or mail_data.get("sender") or "").lower()
+                subject = str(mail_data.get("subject") or "")
+                text = str(mail_data.get("text") or mail_data.get("body") or mail_data.get("content") or mail_data.get("body_text") or "")
+                html = str(mail_data.get("html") or mail_data.get("body_html") or "")
+
+                m = re.search(regex, subject)
+                if m:
+                    log_success(f"从标题抓到验证码: {m.group(1)}")
+                    return m.group(1)
+
+                content = "\n".join([sender, text, html])
+                if "openai" in content.lower() or "openai" in subject.lower():
+                    m = re.search(regex, content)
+                    if m:
+                        log_success(f"从正文抓到验证码: {m.group(1)}")
+                        return m.group(1)
+        except Exception:
+            pass
+        time.sleep(3)
+
+    log_error("Mailfree 超时，未收到验证码")
+    return ""
 
 
 def _mailtm_domains(proxies: Any = None, base_url: str = MAILTM_BASE) -> list[str]:
@@ -282,7 +292,7 @@ def get_email_dropmail(proxies: Any = None) -> tuple[str, str]:
     return "", ""
 
 def get_oai_code_dropmail(session_id: str, email: str, proxies: Any = None) -> str:
-    """使用 Dropmail Session 获取 OpenAI 验证码"""
+    """使用 Dropmail Session 获取验证码"""
     query = """
     query ($id: ID!) {
         session(id: $id) {
@@ -376,7 +386,7 @@ def get_email_1secmail(proxies: Any = None) -> tuple[str, str]:
     return email, "1secmail"
 
 def get_oai_code_1secmail(email: str, proxies: Any = None) -> str:
-    """使用 1secmail 邮箱轮询获取 OpenAI 验证码"""
+    """使用 1secmail 邮箱轮询获取验证码"""
     login, domain = email.split("@")
     url_list = f"https://www.1secmail.com/api/v1/?action=getMessages&login={login}&domain={domain}"
     regex = r"(?<!\d)(\d{6})(?!\d)"
@@ -475,7 +485,7 @@ def get_email_temp_mailfree(proxies: Any = None) -> tuple[str, str]:
     return "", ""
 
 def get_oai_code_temp_mailfree(email: str, token: str, proxies: Any = None) -> str:
-    """使用 Temp-Mailfree 获取 OpenAI 验证码"""
+    """使用 Temp-Mailfree 获取验证码"""
     import urllib.request
     import json
     
@@ -586,7 +596,7 @@ def get_email_and_token(proxies: Any = None, base_url: str = MAILTM_BASE) -> tup
 
 
 def get_oai_code(token: str, email: str, proxies: Any = None, base_url: str = MAILTM_BASE) -> str:
-    """使用 Mail.tm 或 Mail.gw Token 轮询获取 OpenAI 验证码"""
+    """使用 Mail.tm 或 Mail.gw Token 轮询获取验证码"""
     url_list = f"{base_url}/messages"
     regex = r"(?<!\d)(\d{6})(?!\d)"
     seen_ids: set[str] = set()
@@ -675,10 +685,10 @@ def get_email_imap(domain: str) -> str:
     return f"{local}@{domain}"
 
 def get_oai_code_imap(target_email: str, imap_server: str, imap_user: str, imap_pass: str) -> str:
-    """IMAP 获取 OpenAI 邮件验证码"""
+    """IMAP 获取验证码"""
     regex = r"(?<!\d)(\d{6})(?!\d)"
     log_info(f"正在等待 IMAP 邮箱 {target_email} 的验证码...", end="")
-    
+
     seen_ids = set()
 
     for _ in range(40):
@@ -693,23 +703,23 @@ def get_oai_code_imap(target_email: str, imap_server: str, imap_user: str, imap_
 
             if status == "OK" and messages[0].split():
                 message_numbers = messages[0].split()
-                
+
                 # 从最新到最旧检查邮件
                 for email_id in reversed(message_numbers):
                     email_id_str = email_id.decode() if isinstance(email_id, bytes) else str(email_id)
-                    
+
                     # 跳过已处理的邮件
                     if email_id_str in seen_ids:
                         continue
                     seen_ids.add(email_id_str)
-                    
+
                     status, msg_data = mail.fetch(email_id, '(RFC822)')
                     if status != "OK":
                         continue
 
                     raw_email = msg_data[0][1]
                     msg = email_lib.message_from_bytes(raw_email)
-                    
+
                     # 检查发件人
                     sender = str(msg.get("From") or "").lower()
                     if "openai" not in sender and "noreply" not in sender:
@@ -737,15 +747,880 @@ def get_oai_code_imap(target_email: str, imap_server: str, imap_user: str, imap_
                             mail.logout()
                             log_success(f"抓到啦! 验证码: {m.group(1)}")
                             return m.group(1)
-            
+
             mail.logout()
-        except Exception as e:
+        except Exception:
             pass
 
         time.sleep(3)
 
     log_error("IMAP 超时，未收到验证码")
     return ""
+
+
+def _extract_balanced_json(text: str, start_idx: int) -> str:
+    if start_idx < 0 or start_idx >= len(text):
+        return ""
+    opener = text[start_idx]
+    closer = "]" if opener == "[" else "}" if opener == "{" else ""
+    if not closer:
+        return ""
+
+    depth = 0
+    in_string = False
+    escaped = False
+    for idx in range(start_idx, len(text)):
+        ch = text[idx]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+
+        if ch == '"':
+            in_string = True
+        elif ch == opener:
+            depth += 1
+        elif ch == closer:
+            depth -= 1
+            if depth == 0:
+                return text[start_idx:idx + 1]
+    return ""
+
+
+def _extract_workspace_info_from_text(text: str) -> Dict[str, Any]:
+    if not text:
+        return {}
+
+    variants: List[str] = []
+    for candidate in [text, html.unescape(text)]:
+        candidate = (candidate or "").strip()
+        if candidate and candidate not in variants:
+            variants.append(candidate)
+
+    for candidate in variants:
+        info: Dict[str, Any] = {}
+
+        marker_idx = candidate.find('"workspaces"')
+        if marker_idx >= 0:
+            array_start = candidate.find("[", marker_idx)
+            if array_start >= 0:
+                array_raw = _extract_balanced_json(candidate, array_start)
+                if array_raw:
+                    try:
+                        parsed = json.loads(array_raw)
+                        if isinstance(parsed, list):
+                            info["workspaces"] = parsed
+                    except Exception:
+                        pass
+
+        for key in ["default_workspace_id", "last_active_workspace_id", "workspace_id"]:
+            match = re.search(rf'"{key}"\s*:\s*"([^"\\]+)"', candidate)
+            if match:
+                info[key] = match.group(1).strip()
+
+        if info.get("workspaces") or info.get("default_workspace_id") or info.get("last_active_workspace_id") or info.get("workspace_id"):
+            return info
+
+    return {}
+
+
+def _fetch_client_auth_session_dump(session: requests.Session, timeout: int = 15) -> Dict[str, Any]:
+    try:
+        resp = session.get(
+            "https://auth.openai.com/api/accounts/client_auth_session_dump",
+            headers={"accept": "application/json"},
+            timeout=timeout,
+        )
+        log_info(f"client_auth_session_dump 状态: {resp.status_code}")
+        if resp.status_code != 200:
+            log_error_detail(resp.text[:1000])
+            return {}
+        data = resp.json()
+        if not isinstance(data, dict):
+            return {}
+        client_auth_session = data.get("client_auth_session") or {}
+        if isinstance(client_auth_session, str):
+            try:
+                client_auth_session = json.loads(client_auth_session)
+            except Exception:
+                client_auth_session = {}
+        if isinstance(client_auth_session, dict):
+            log_info(f"client_auth_session_dump 顶层键: {list(data.keys())[:30]}")
+            log_info(f"client_auth_session 键: {list(client_auth_session.keys())[:40]}")
+        return client_auth_session if isinstance(client_auth_session, dict) else {}
+    except Exception as e:
+        log_error(f"获取 client_auth_session_dump 失败: {e}")
+        return {}
+
+
+def _extract_add_phone_hints(text: str) -> Dict[str, Any]:
+    raw = html.unescape(text or "")
+    if not raw:
+        return {}
+    title = ""
+    title_match = re.search(r"<title[^>]*>(.*?)</title>", raw, re.IGNORECASE | re.DOTALL)
+    if title_match:
+        title = re.sub(r"\s+", " ", title_match.group(1)).strip()
+    api_paths = sorted(set(re.findall(r'/(?:api|u-api)/[^"\'\s<>()]+', raw)))[:20]
+    keywords = [keyword for keyword in ["add-phone", "phone", "sms", "verification", "workspace"] if keyword in raw.lower()]
+    return {
+        "title": title,
+        "api_paths": api_paths,
+        "keywords": keywords,
+    }
+
+
+@dataclass
+class MailCheckpoint:
+    ids: set[str]
+    codes: set[str]
+
+
+def _extract_six_digit_codes(*parts: str) -> set[str]:
+    codes: set[str] = set()
+    for part in parts:
+        if not part:
+            continue
+        for match in re.findall(r"(?<!\d)(\d{6})(?!\d)", str(part)):
+            codes.add(match)
+    return codes
+
+
+def _normalize_provider_message_id(provider: str, msg: Dict[str, Any], fallback_index: int) -> str:
+    candidates = [
+        msg.get("id"),
+        msg.get("_id"),
+        msg.get("messageId"),
+        msg.get("message_id"),
+        msg.get("downloadUrl"),
+    ]
+    for candidate in candidates:
+        value = str(candidate or "").strip()
+        if value:
+            return value
+    subject = str(msg.get("subject") or msg.get("headerSubject") or "")
+    sender = str(msg.get("from") or msg.get("fromAddr") or "")
+    return f"{provider}:{fallback_index}:{hashlib.sha1((sender + '|' + subject).encode('utf-8', 'ignore')).hexdigest()}"
+
+
+def capture_mail_checkpoint(email_provider: str, email: str, dev_token: str, proxies: Any = None, imap_config: Optional[dict] = None) -> MailCheckpoint:
+    ids: set[str] = set()
+    codes: set[str] = set()
+    try:
+        if imap_config:
+            mail = imaplib.IMAP4_SSL(imap_config["server"], 993)
+            mail.login(imap_config["user"], imap_config["password"])
+            mail.select("inbox")
+            status, messages = mail.search(None, f'(TO "{email}")')
+            if status == "OK" and messages and messages[0]:
+                for email_id in messages[0].split():
+                    email_id_str = email_id.decode() if isinstance(email_id, bytes) else str(email_id)
+                    ids.add(email_id_str)
+            mail.logout()
+            return MailCheckpoint(ids=ids, codes=codes)
+
+        if email_provider == "domain":
+            try:
+                s = dev_token if hasattr(dev_token, "get") else _mailfree_login(DEFAULT_WORKER_URL, DEFAULT_MF_USER, DEFAULT_MF_PASS, proxies)
+                resp = s.get(f"{DEFAULT_WORKER_URL}/api/emails", params={"mailbox": email, "limit": 20}, timeout=15)
+                if resp.status_code == 200:
+                    messages = resp.json()
+                    if isinstance(messages, dict):
+                        messages = messages.get("list") or messages.get("data") or messages.get("emails") or []
+                    for idx, msg in enumerate(messages if isinstance(messages, list) else []):
+                        if not isinstance(msg, dict):
+                            continue
+                        ids.add(_normalize_provider_message_id(email_provider, msg, idx))
+                        codes.update(_extract_six_digit_codes(msg.get("subject") or ""))
+            except Exception:
+                pass
+        elif email_provider == "1secmail":
+            login, domain = email.split("@")
+            url = f"https://www.1secmail.com/api/v1/?action=getMessages&login={login}&domain={domain}"
+            resp = requests.get(url, proxies=proxies, impersonate="chrome", timeout=15)
+            if resp.status_code == 200:
+                messages = resp.json()
+                for idx, msg in enumerate(messages if isinstance(messages, list) else []):
+                    if not isinstance(msg, dict):
+                        continue
+                    ids.add(_normalize_provider_message_id(email_provider, msg, idx))
+                    codes.update(_extract_six_digit_codes(msg.get("subject") or ""))
+        elif email_provider == "dropmail":
+            resp = requests.post(
+                "https://dropmail.me/api/graphql/web-test-wgq6m5i",
+                json={"query": "query ($id: ID!) { session(id: $id) { mails { fromAddr headerSubject text downloadUrl } } }", "variables": {"id": dev_token}},
+                impersonate="chrome",
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                mails = (((resp.json() or {}).get("data") or {}).get("session") or {}).get("mails") or []
+                for idx, msg in enumerate(mails if isinstance(mails, list) else []):
+                    if not isinstance(msg, dict):
+                        continue
+                    ids.add(_normalize_provider_message_id(email_provider, msg, idx))
+                    codes.update(_extract_six_digit_codes(msg.get("headerSubject") or "", msg.get("text") or ""))
+        elif email_provider == "tempmailfree":
+            import urllib.request as _urllib_request
+            import json as _json
+            req = _urllib_request.Request(f"{TEMPMAILFREE_BASE}/api/messages/{dev_token}")
+            req.add_header('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
+            with _urllib_request.urlopen(req, timeout=15) as response:
+                raw = _json.loads(response.read().decode('utf-8'))
+                messages = raw if isinstance(raw, list) else [raw]
+                for idx, msg in enumerate(messages):
+                    if not isinstance(msg, dict):
+                        continue
+                    ids.add(_normalize_provider_message_id(email_provider, msg, idx))
+                    codes.update(_extract_six_digit_codes(msg.get("subject") or "", msg.get("body") or msg.get("text") or "", msg.get("html") or ""))
+        else:
+            base_url = DUCKMAIL_BASE if email_provider == "duckmail" else "https://api.mail.gw" if email_provider == "mailgw" else MAILTM_BASE
+            resp = requests.get(
+                f"{base_url}/messages",
+                headers=_mailtm_headers(token=dev_token),
+                proxies=proxies,
+                impersonate="chrome",
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                messages = data if isinstance(data, list) else (data.get("hydra:member") or data.get("messages") or []) if isinstance(data, dict) else []
+                for idx, msg in enumerate(messages):
+                    if not isinstance(msg, dict):
+                        continue
+                    ids.add(_normalize_provider_message_id(email_provider, msg, idx))
+                    codes.update(_extract_six_digit_codes(msg.get("subject") or "", msg.get("intro") or "", msg.get("text") or ""))
+    except Exception:
+        pass
+    return MailCheckpoint(ids=ids, codes=codes)
+
+
+def _get_fresh_oai_code(email_provider: str, email: str, dev_token: str, proxies: Any = None, imap_config: Optional[dict] = None, checkpoint: Optional[MailCheckpoint] = None, forbidden_codes: Optional[set[str]] = None) -> str:
+    checkpoint = checkpoint or MailCheckpoint(ids=set(), codes=set())
+    forbidden = set(forbidden_codes or set()) | set(checkpoint.codes)
+    regex = r"(?<!\d)(\d{6})(?!\d)"
+
+    def _extract_first_fresh_code(content: str) -> str:
+        for candidate in re.findall(regex, content or ""):
+            if candidate not in forbidden:
+                return candidate
+        return ""
+
+    if imap_config:
+        log_info(f"正在等待 IMAP 邮箱 {email} 的新验证码...", end="")
+        for _ in range(40):
+            log_plain(".", end="")
+            try:
+                mail = imaplib.IMAP4_SSL(imap_config["server"], 993)
+                mail.login(imap_config["user"], imap_config["password"])
+                mail.select("inbox")
+                status, messages = mail.search(None, f'(TO "{email}")')
+                if status == "OK" and messages and messages[0]:
+                    for email_id in reversed(messages[0].split()):
+                        email_id_str = email_id.decode() if isinstance(email_id, bytes) else str(email_id)
+                        if email_id_str in checkpoint.ids:
+                            continue
+                        status, msg_data = mail.fetch(email_id, '(RFC822)')
+                        if status != "OK":
+                            continue
+                        raw_email = msg_data[0][1]
+                        msg = email_lib.message_from_bytes(raw_email)
+                        sender = str(msg.get("From") or "").lower()
+                        if "openai" not in sender and "noreply" not in sender:
+                            continue
+                        content = ""
+                        if msg.is_multipart():
+                            for part in msg.walk():
+                                content_disposition = str(part.get("Content-Disposition"))
+                                if "attachment" not in content_disposition:
+                                    payload = part.get_payload(decode=True)
+                                    if payload:
+                                        content += payload.decode('utf-8', errors='ignore')
+                        else:
+                            payload = msg.get_payload(decode=True)
+                            if payload:
+                                content = payload.decode('utf-8', errors='ignore')
+                        code = _extract_first_fresh_code(content)
+                        if code:
+                            mail.store(email_id, '+FLAGS', '\\Deleted')
+                            mail.expunge()
+                            mail.logout()
+                            log_success(f"抓到新的验证码: {code}")
+                            return code
+                mail.logout()
+            except Exception:
+                pass
+            time.sleep(3)
+        log_error("IMAP 超时，未收到新验证码")
+        return ""
+
+    log_info(f"正在等待邮箱 {email} 的新验证码...", end="")
+    for _ in range(40):
+        log_plain(".", end="")
+        try:
+            if email_provider == "domain":
+                s = dev_token if hasattr(dev_token, "get") else _mailfree_login(DEFAULT_WORKER_URL, DEFAULT_MF_USER, DEFAULT_MF_PASS, proxies)
+                resp = s.get(f"{DEFAULT_WORKER_URL}/api/emails", params={"mailbox": email, "limit": 20}, timeout=15)
+                if resp.status_code == 200:
+                    messages = resp.json()
+                    if isinstance(messages, dict):
+                        messages = messages.get("list") or messages.get("data") or messages.get("emails") or []
+                    for idx, msg in enumerate(messages if isinstance(messages, list) else []):
+                        if not isinstance(msg, dict):
+                            continue
+                        msg_id = _normalize_provider_message_id(email_provider, msg, idx)
+                        if msg_id in checkpoint.ids:
+                            continue
+                        raw_id = str(msg.get("id") or msg.get("_id") or "").strip()
+                        if not raw_id:
+                            continue
+                        detail_resp = s.get(f"{DEFAULT_WORKER_URL}/api/email/{raw_id}", timeout=15)
+                        if detail_resp.status_code != 200:
+                            continue
+                        mail_raw = detail_resp.json()
+                        mail_data = mail_raw.get("data") if (isinstance(mail_raw, dict) and "data" in mail_raw) else mail_raw
+                        if not isinstance(mail_data, dict):
+                            continue
+                        sender = str(mail_data.get("from") or mail_data.get("sender") or "").lower()
+                        content = "\n".join([
+                            str(mail_data.get("subject") or ""),
+                            str(mail_data.get("text") or mail_data.get("body") or mail_data.get("content") or mail_data.get("body_text") or ""),
+                            str(mail_data.get("html") or mail_data.get("body_html") or ""),
+                        ])
+                        if "openai" not in sender and "openai" not in content.lower():
+                            continue
+                        code = _extract_first_fresh_code(content)
+                        if code:
+                            log_success(f"抓到新的验证码: {code}")
+                            return code
+            elif email_provider == "1secmail":
+                login, domain = email.split("@")
+                url_list = f"https://www.1secmail.com/api/v1/?action=getMessages&login={login}&domain={domain}"
+                resp = requests.get(url_list, proxies=proxies, impersonate="chrome", timeout=15)
+                if resp.status_code == 200:
+                    messages = resp.json()
+                    for idx, msg in enumerate(messages if isinstance(messages, list) else []):
+                        if not isinstance(msg, dict):
+                            continue
+                        msg_id = _normalize_provider_message_id(email_provider, msg, idx)
+                        if msg_id in checkpoint.ids:
+                            continue
+                        read_url = f"https://www.1secmail.com/api/v1/?action=readMessage&login={login}&domain={domain}&id={msg.get('id')}"
+                        read_resp = requests.get(read_url, proxies=proxies, impersonate="chrome", timeout=15)
+                        if read_resp.status_code != 200:
+                            continue
+                        mail_data = read_resp.json()
+                        sender = str(mail_data.get("from") or "").lower()
+                        content = "\n".join([str(mail_data.get("subject") or ""), str(mail_data.get("textBody") or ""), str(mail_data.get("htmlBody") or "")])
+                        if "openai" not in sender and "openai" not in content.lower():
+                            continue
+                        code = _extract_first_fresh_code(content)
+                        if code:
+                            log_success(f"抓到新的验证码: {code}")
+                            return code
+            elif email_provider == "dropmail":
+                resp = requests.post(
+                    "https://dropmail.me/api/graphql/web-test-wgq6m5i",
+                    json={"query": "query ($id: ID!) { session(id: $id) { mails { fromAddr headerSubject text downloadUrl } } }", "variables": {"id": dev_token}},
+                    impersonate="chrome",
+                    timeout=15,
+                )
+                if resp.status_code == 200:
+                    mails = (((resp.json() or {}).get("data") or {}).get("session") or {}).get("mails") or []
+                    for idx, msg in enumerate(mails if isinstance(mails, list) else []):
+                        if not isinstance(msg, dict):
+                            continue
+                        msg_id = _normalize_provider_message_id(email_provider, msg, idx)
+                        if msg_id in checkpoint.ids:
+                            continue
+                        content = "\n".join([str(msg.get("headerSubject") or ""), str(msg.get("text") or "")])
+                        sender = str(msg.get("fromAddr") or "").lower()
+                        if "openai" not in sender and "openai" not in content.lower():
+                            continue
+                        code = _extract_first_fresh_code(content)
+                        if code:
+                            log_success(f"抓到新的验证码: {code}")
+                            return code
+            elif email_provider == "tempmailfree":
+                import urllib.request as _urllib_request
+                import json as _json
+                req = _urllib_request.Request(f"{TEMPMAILFREE_BASE}/api/messages/{dev_token}")
+                req.add_header('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
+                with _urllib_request.urlopen(req, timeout=15) as response:
+                    raw = _json.loads(response.read().decode('utf-8'))
+                    messages = raw if isinstance(raw, list) else [raw]
+                    for idx, msg in enumerate(messages):
+                        if not isinstance(msg, dict):
+                            continue
+                        msg_id = _normalize_provider_message_id(email_provider, msg, idx)
+                        if msg_id in checkpoint.ids:
+                            continue
+                        sender = str(msg.get("from") or "").lower()
+                        content = "\n".join([str(msg.get("subject") or ""), str(msg.get("body") or msg.get("text") or ""), str(msg.get("html") or "")])
+                        if "openai" not in sender and "openai" not in content.lower():
+                            continue
+                        code = _extract_first_fresh_code(content)
+                        if code:
+                            log_success(f"抓到新的验证码: {code}")
+                            return code
+            else:
+                base_url = DUCKMAIL_BASE if email_provider == "duckmail" else "https://api.mail.gw" if email_provider == "mailgw" else MAILTM_BASE
+                resp = requests.get(
+                    f"{base_url}/messages",
+                    headers=_mailtm_headers(token=dev_token),
+                    proxies=proxies,
+                    impersonate="chrome",
+                    timeout=15,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    messages = data if isinstance(data, list) else (data.get("hydra:member") or data.get("messages") or []) if isinstance(data, dict) else []
+                    for idx, msg in enumerate(messages):
+                        if not isinstance(msg, dict):
+                            continue
+                        msg_id = _normalize_provider_message_id(email_provider, msg, idx)
+                        if msg_id in checkpoint.ids:
+                            continue
+                        read_resp = requests.get(
+                            f"{base_url}/messages/{msg.get('id')}",
+                            headers=_mailtm_headers(token=dev_token),
+                            proxies=proxies,
+                            impersonate="chrome",
+                            timeout=15,
+                        )
+                        if read_resp.status_code != 200:
+                            continue
+                        mail_data = read_resp.json()
+                        sender = str(((mail_data.get("from") or {}).get("address") or "")).lower()
+                        html_data = mail_data.get("html") or ""
+                        if isinstance(html_data, list):
+                            html_data = "\n".join(str(x) for x in html_data)
+                        content = "\n".join([str(mail_data.get("subject") or ""), str(mail_data.get("intro") or ""), str(mail_data.get("text") or ""), str(html_data)])
+                        if "openai" not in sender and "openai" not in content.lower():
+                            continue
+                        code = _extract_first_fresh_code(content)
+                        if code:
+                            log_success(f"抓到新的验证码: {code}")
+                            return code
+        except Exception:
+            pass
+        time.sleep(3)
+
+    log_error("超时，未收到新验证码")
+    return ""
+
+
+
+
+def _read_first_otp(email_provider: str, email: str, dev_token: str, proxies: Any = None, imap_config: Optional[dict] = None) -> str:
+    if imap_config:
+        return get_oai_code_imap(
+            email,
+            imap_config["server"],
+            imap_config["user"],
+            imap_config["password"],
+        )
+    if email_provider == "domain":
+        return get_oai_code_domain(email, dev_token, proxies)
+    if email_provider == "1secmail":
+        return get_oai_code_1secmail(email, proxies)
+    if email_provider == "dropmail":
+        return get_oai_code_dropmail(dev_token, email, proxies)
+    if email_provider == "mailgw":
+        return get_oai_code(dev_token, email, proxies, base_url="https://api.mail.gw")
+    if email_provider == "tempmailfree":
+        return get_oai_code_temp_mailfree(email, dev_token, proxies)
+    if email_provider == "duckmail":
+        return get_oai_code(dev_token, email, proxies, base_url=DUCKMAIL_BASE)
+    return get_oai_code(dev_token, email, proxies)
+
+
+def _build_workspace_context(session: requests.Session, create_account_resp: Any, *, timeout: int = 15) -> Dict[str, Any]:
+    create_account_data: Dict[str, Any] = {}
+    create_continue_url = ""
+    follow_resp = None
+    workspace_hint: Dict[str, Any] = {}
+
+    try:
+        create_account_data = create_account_resp.json()
+        create_continue_url = str((create_account_data or {}).get("continue_url") or "").strip()
+        workspace_hint = {
+            "workspaces": create_account_data.get("workspaces") or [],
+            "default_workspace_id": create_account_data.get("default_workspace_id") or "",
+            "last_active_workspace_id": create_account_data.get("last_active_workspace_id") or "",
+            "workspace_id": create_account_data.get("workspace_id") or "",
+        }
+        if any(workspace_hint.values()):
+            log_info(f"create_account 响应命中 workspace 字段: {list(k for k, v in workspace_hint.items() if v)}")
+        if create_continue_url:
+            follow_resp = session.get(create_continue_url, timeout=timeout)
+            log_info(f"create_account continue_url 跟进状态: {follow_resp.status_code}")
+            follow_hint = _extract_workspace_info_from_text(follow_resp.text)
+            if follow_hint:
+                workspace_hint.update({k: v for k, v in follow_hint.items() if v})
+                log_info(f"continue 页面命中 workspace 字段: {list(follow_hint.keys())}")
+    except Exception as e:
+        log_info(f"create_account 响应未提供可用 continue_url: {e}")
+
+    auth_cookie = session.cookies.get("oai-client-auth-session")
+    auth_json: Dict[str, Any] = {}
+    if auth_cookie:
+        cookie_parts = auth_cookie.split(".")
+        log_info(f"授权 Cookie 分段数: {len(cookie_parts)}")
+        for idx, part in enumerate(cookie_parts[:4]):
+            decoded = _decode_jwt_segment(part)
+            if decoded:
+                log_info(f"授权 Cookie 第 {idx} 段键: {list(decoded.keys())[:20]}")
+                if not auth_json and isinstance(decoded.get("workspaces"), list):
+                    auth_json = decoded
+            else:
+                log_info(f"授权 Cookie 第 {idx} 段不可直接解码，前 80 字符: {part[:80]}")
+        if not auth_json and len(cookie_parts) > 1:
+            auth_json = _decode_jwt_segment(cookie_parts[1])
+
+    if not auth_json and workspace_hint:
+        auth_json = dict(workspace_hint)
+
+    dump_session = _fetch_client_auth_session_dump(session, timeout=timeout)
+    if dump_session:
+        dump_hint = {
+            "workspaces": dump_session.get("workspaces") or [],
+            "default_workspace_id": dump_session.get("default_workspace_id") or "",
+            "last_active_workspace_id": dump_session.get("last_active_workspace_id") or "",
+            "workspace_id": dump_session.get("workspace_id") or "",
+        }
+        if any(dump_hint.values()):
+            workspace_hint.update({k: v for k, v in dump_hint.items() if v})
+            auth_json.update({k: v for k, v in dump_hint.items() if v and (k != "workspaces" or not auth_json.get("workspaces"))})
+            log_info(f"client_auth_session_dump 命中字段: {list(k for k, v in dump_hint.items() if v)}")
+
+    workspaces = auth_json.get("workspaces") or workspace_hint.get("workspaces") or []
+    if follow_resp is not None:
+        log_info(f"continue 页面 URL: {follow_resp.url}")
+        title_match = re.search(r"<title[^>]*>(.*?)</title>", follow_resp.text, re.IGNORECASE | re.DOTALL)
+        if title_match:
+            page_title = re.sub(r"\s+", " ", html.unescape(title_match.group(1))).strip()
+            if page_title:
+                log_info(f"continue 页面标题: {page_title}")
+
+    first_workspace = workspaces[0] if isinstance(workspaces, list) and workspaces else {}
+    workspace_id = str(
+        (first_workspace or {}).get("id")
+        or auth_json.get("default_workspace_id")
+        or auth_json.get("last_active_workspace_id")
+        or auth_json.get("workspace_id")
+        or workspace_hint.get("default_workspace_id")
+        or workspace_hint.get("last_active_workspace_id")
+        or workspace_hint.get("workspace_id")
+        or ""
+    ).strip()
+
+    branch_url = str(getattr(follow_resp, "url", "") or "")
+    branch_name = ""
+    if "/add-phone" in branch_url:
+        branch_name = "add-phone"
+    elif "/verify-your-identity" in branch_url:
+        branch_name = "verify-your-identity"
+    elif branch_url:
+        branch_name = urlparse(branch_url).path or branch_url
+
+    return {
+        "workspace_id": workspace_id,
+        "auth_cookie": auth_cookie or "",
+        "auth_json": auth_json,
+        "workspace_hint": workspace_hint,
+        "follow_resp": follow_resp,
+        "branch_url": branch_url,
+        "branch_name": branch_name,
+        "create_account_data": create_account_data,
+    }
+
+
+def _log_step_payload(label: str, data: Any) -> Optional[str]:
+    if not isinstance(data, dict):
+        log_info(f"{label} payload 非 dict: {type(data).__name__}")
+        return None
+    page = data.get("page") or {}
+    page_type = page.get("type") if isinstance(page, dict) else None
+    continue_url = data.get("continue_url")
+    method = data.get("method")
+    summary = {
+        "page_type": page_type,
+        "continue_url": continue_url,
+        "method": method,
+    }
+    summary = {k: v for k, v in summary.items() if v not in (None, "", [], {})}
+    if summary:
+        log_info(f"{label} step 摘要: {json.dumps(summary, ensure_ascii=False)}")
+    return str(page_type or "").strip() or None
+
+
+def _log_response_headers(label: str, resp: Any) -> None:
+    try:
+        headers = dict(resp.headers)
+    except Exception:
+        headers = {}
+    interesting = {}
+    for key, value in headers.items():
+        lk = str(key).lower()
+        if lk in ("location", "x-request-id", "x-trace-id", "cf-ray"):
+            interesting[key] = value
+    if interesting:
+        log_info(f"{label} 响应头: {json.dumps(interesting, ensure_ascii=False)[:800]}")
+
+
+
+def _follow_redirects_to_token(session: requests.Session, continue_url: str, oauth: OAuthStart, *, timeout: int = 15) -> Optional[str]:
+    current_url = continue_url
+    log_info(f"开始跟踪重定向链: {continue_url}")
+    for idx in range(8):
+        final_resp = session.get(current_url, allow_redirects=False, timeout=timeout)
+        location = final_resp.headers.get("Location") or ""
+        log_info(f"重定向第 {idx + 1} 跳状态: {final_resp.status_code} | URL: {current_url}")
+        if location:
+            log_info(f"重定向第 {idx + 1} 跳 Location: {location}")
+        if final_resp.status_code not in [301, 302, 303, 307, 308]:
+            body_preview = (final_resp.text or "")[:500].replace("\n", " ")
+            if body_preview:
+                log_error_detail(body_preview)
+            break
+        if not location:
+            break
+        next_url = urllib.parse.urljoin(current_url, location)
+        if "code=" in next_url and "state=" in next_url:
+            log_info(f"重定向链捕获 callback: {next_url}")
+            return submit_callback_url(
+                callback_url=next_url,
+                code_verifier=oauth.code_verifier,
+                redirect_uri=oauth.redirect_uri,
+                expected_state=oauth.state,
+            )
+        current_url = next_url
+    return None
+
+
+def signin_recovery_flow(
+    *,
+    email: str,
+    password: str,
+    dev_token: str,
+    proxies: Any,
+    email_provider: str,
+    imap_config: Optional[dict],
+    first_code: str,
+    checkpoint: MailCheckpoint,
+    result_queue: queue.Queue,
+    stop_event: threading.Event,
+) -> None:
+    if stop_event.is_set():
+        return
+
+    recovery = requests.Session(proxies=proxies, impersonate="chrome")
+    try:
+        oauth = generate_oauth_url()
+        log_info(f"恢复登录 OAuth 已生成: redirect_uri={oauth.redirect_uri} state={oauth.state}")
+        recovery.get(oauth.auth_url, timeout=15)
+        did = recovery.cookies.get("oai-did")
+        if not did:
+            log_error("恢复登录流程未获取到 Device ID")
+            return
+
+        login_body = json.dumps({"username": {"value": email, "kind": "email"}, "screen_hint": "login"}, separators=(",", ":"))
+        log_info(f"恢复登录开始: email={email}")
+        log_info("恢复登录跳过 Sentinel POW challenge，直接使用空 p 请求 sentinel")
+        pow_token = ""
+        sen_req_body = json.dumps({"p": pow_token, "id": did, "flow": "authorize_continue"}, separators=(",", ":"))
+        sen_resp = recovery.post(
+            SENTINEL_REQ_URL,
+            headers={
+                "origin": SENTINEL_BASE,
+                "referer": SENTINEL_FRAME_URL,
+                "content-type": "text/plain;charset=UTF-8",
+            },
+            data=sen_req_body,
+            impersonate="chrome",
+            timeout=15,
+        )
+        if sen_resp.status_code != 200:
+            log_error(f"恢复登录 Sentinel 请求失败: {sen_resp.status_code}")
+            log_error_detail(sen_resp.text[:400])
+            return
+        sen_token = sen_resp.json().get("token")
+        log_info(f"Sentinel状态: {sen_resp.status_code}")
+        sentinel = json.dumps({"p": pow_token, "t": "", "c": sen_token, "id": did, "flow": "authorize_continue"}, separators=(",", ":"))
+
+        authorize_resp = recovery.post(
+            "https://auth.openai.com/api/accounts/authorize/continue",
+            headers={
+                "referer": "https://auth.openai.com/sign-in",
+                "accept": "application/json",
+                "content-type": "application/json",
+                "openai-sentinel-token": sentinel,
+            },
+            data=login_body,
+        )
+        if authorize_resp.status_code not in (200, 201):
+            log_error(f"恢复登录 authorize/continue 失败: {authorize_resp.status_code}")
+            log_error_detail(authorize_resp.text[:400])
+            return
+        log_info(f"恢复登录 authorize/continue 成功: {authorize_resp.status_code}")
+
+        authorize_data: Dict[str, Any] = {}
+        authorize_step = ""
+        try:
+            authorize_data = authorize_resp.json()
+            log_info(f"恢复登录 authorize 响应摘要键: {list(authorize_data.keys())[:20]}")
+            authorize_step = _log_step_payload("恢复登录 authorize/continue", authorize_data) or ""
+            _log_response_headers("恢复登录 authorize/continue", authorize_resp)
+            authorize_continue_url = str((authorize_data.get("continue_url") or "")).strip()
+            if authorize_continue_url:
+                log_info(f"恢复登录 authorize continue_url: {authorize_continue_url}")
+                recovery.get(authorize_continue_url, timeout=15)
+        except Exception:
+            pass
+
+        otp_already_sent = authorize_step == "email_otp_send"
+        needs_otp = any(keyword in authorize_step for keyword in ["otp", "verification"]) if authorize_step else False
+        password_resp = None
+        password_step = ""
+
+        if not needs_otp:
+            password_resp = recovery.post(
+                "https://auth.openai.com/api/accounts/user/register",
+                headers={
+                    "referer": "https://auth.openai.com/sign-in/password",
+                    "accept": "application/json",
+                    "content-type": "application/json",
+                },
+                data=json.dumps({"password": password, "username": email}, separators=(",", ":")),
+            )
+            if password_resp.status_code not in (200, 201):
+                log_error(f"恢复登录密码提交失败: {password_resp.status_code}")
+                log_error_detail(password_resp.text[:400])
+                if "invalid_auth_step" not in password_resp.text:
+                    return
+                log_info("恢复登录密码步骤无效，改为直接等待第二次 OTP")
+                needs_otp = True
+            else:
+                log_info(f"恢复登录密码提交状态: {password_resp.status_code}")
+                try:
+                    login_data = password_resp.json()
+                    log_info(f"恢复登录密码响应摘要键: {list(login_data.keys())[:20]}")
+                    password_step = _log_step_payload("恢复登录密码提交", login_data) or ""
+                    _log_response_headers("恢复登录密码提交", password_resp)
+                    login_continue_url = str((login_data.get("continue_url") or "")).strip()
+                    if login_continue_url:
+                        log_info(f"恢复登录密码 continue_url: {login_continue_url}")
+                        recovery.get(login_continue_url, timeout=15)
+                except Exception:
+                    pass
+                otp_already_sent = otp_already_sent or password_step == "email_otp_send"
+                needs_otp = needs_otp or any(keyword in password_step for keyword in ["otp", "verification"]) if password_step else True
+
+        if not otp_already_sent:
+            otp_send_resp = recovery.post(
+                "https://auth.openai.com/api/accounts/passwordless/send-otp",
+                headers={
+                    "referer": "https://auth.openai.com/sign-in/password",
+                    "accept": "application/json",
+                    "content-type": "application/json",
+                },
+            )
+            if otp_send_resp.status_code not in (200, 201):
+                log_error(f"恢复登录发送第二次 OTP 失败: {otp_send_resp.status_code}")
+                log_error_detail(otp_send_resp.text[:400])
+                return
+            log_info(f"恢复登录第二次 OTP 已发送: {otp_send_resp.status_code}")
+        else:
+            log_info("恢复登录当前步骤显示 OTP 已发送，直接等待最新验证码")
+
+        second_code = _get_fresh_oai_code(
+            email_provider,
+            email,
+            dev_token,
+            proxies,
+            imap_config,
+            checkpoint,
+            {first_code} if first_code else set(),
+        )
+        if not second_code:
+            log_error("恢复登录未获取到新的第二次 OTP")
+            return
+
+        log_info(f"恢复登录获取到第二次 OTP: {second_code}")
+
+        verify_resp = recovery.post(
+            "https://auth.openai.com/api/accounts/email-otp/validate",
+            headers={
+                "referer": "https://auth.openai.com/email-verification",
+                "accept": "application/json",
+                "content-type": "application/json",
+            },
+            data=json.dumps({"code": second_code}, separators=(",", ":")),
+        )
+        if verify_resp.status_code != 200:
+            log_error(f"恢复登录第二次 OTP 校验失败: {verify_resp.status_code}")
+            log_error_detail(verify_resp.text[:400])
+            return
+        log_info(f"OTP 校验状态: {verify_resp.status_code}")
+
+        try:
+            verify_data = verify_resp.json()
+            log_info(f"恢复登录 OTP 校验响应摘要键: {list(verify_data.keys())[:20]}")
+            verify_continue_url = str((verify_data.get("continue_url") or "")).strip()
+            if verify_continue_url:
+                log_info(f"恢复登录 OTP 校验 continue_url: {verify_continue_url}")
+                recovery.get(verify_continue_url, timeout=15)
+        except Exception:
+            pass
+
+        context = _build_workspace_context(recovery, verify_resp, timeout=15)
+        workspace_id = str(context.get("workspace_id") or "").strip()
+        log_info(f"恢复登录 workspace_context branch={context.get('branch_name') or 'unknown'} url={context.get('branch_url') or ''}")
+        if not workspace_id:
+            log_error("恢复登录流程仍未解析到 workspace_id")
+            return
+
+        log_info(f"恢复登录解析到 workspace_id: {workspace_id}")
+
+        select_resp = recovery.post(
+            "https://auth.openai.com/api/accounts/workspace/select",
+            headers={
+                "referer": "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+                "content-type": "application/json",
+            },
+            data=json.dumps({"workspace_id": workspace_id}, separators=(",", ":")),
+        )
+        if select_resp.status_code != 200:
+            log_error(f"恢复登录 workspace/select 失败: {select_resp.status_code}")
+            log_error_detail(select_resp.text[:400])
+            return
+        log_info(f"恢复登录 workspace/select 成功: {select_resp.status_code}")
+
+        continue_url = str((select_resp.json() or {}).get("continue_url") or "").strip()
+        if not continue_url:
+            log_error("恢复登录 workspace/select 响应里缺少 continue_url")
+            return
+
+        log_info(f"恢复登录 workspace/select continue_url: {continue_url}")
+
+        token_json = _follow_redirects_to_token(recovery, continue_url, oauth, timeout=15)
+        if token_json and not stop_event.is_set():
+            log_success("恢复登录流程成功获取 token")
+            result_queue.put(token_json)
+            stop_event.set()
+        else:
+            log_error("恢复登录流程未能在重定向链中捕获 callback/token")
+    except Exception as e:
+        log_error(f"恢复登录流程异常: {e}")
+    finally:
+        try:
+            recovery.close()
+        except Exception:
+            pass
 
 
 # ==========================================
@@ -755,6 +1630,11 @@ def get_oai_code_imap(target_email: str, imap_server: str, imap_user: str, imap_
 AUTH_URL = "https://auth.openai.com/oauth/authorize"
 TOKEN_URL = "https://auth.openai.com/oauth/token"
 CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+SENTINEL_BASE = "https://sentinel.openai.com"
+SENTINEL_REQ_URL = f"{SENTINEL_BASE}/backend-api/sentinel/req"
+SENTINEL_FRAME_URL = f"{SENTINEL_BASE}/backend-api/sentinel/frame.html?sv=20260219f9f6"
+SENTINEL_POW_CHALLENGE_URL = f"{SENTINEL_BASE}/backend-api/sentinel/pow/challenge"
+SENTINEL_POW_VERIFY_URL = f"{SENTINEL_BASE}/backend-api/sentinel/pow/verify"
 
 DEFAULT_REDIRECT_URI = f"http://localhost:1455/auth/callback"
 DEFAULT_SCOPE = "openid email profile offline_access"
@@ -849,6 +1729,171 @@ def _to_int(v: Any) -> int:
         return int(v)
     except (TypeError, ValueError):
         return 0
+
+
+def _fnv1a_hex(value: str) -> str:
+    h = 0x811C9DC5
+    for ch in value:
+        h ^= ord(ch)
+        h = (h * 0x1000193) % 0x100000000
+        h = (h * 0x1000193) % 0x100000000
+        h = (h * 0x1000193) % 0x100000000
+    return f"{h:08x}"
+
+
+def _normalize_pow_difficulty(raw: Any) -> str:
+    value = str(raw or "").strip().lower()
+    if not value:
+        return ""
+    if value.startswith("0x"):
+        value = value[2:]
+    if value.startswith("~"):
+        value = value[1:]
+    return value
+
+
+def _extract_pow_params(data: Any) -> Dict[str, Any]:
+    if not isinstance(data, dict):
+        return {}
+
+    candidates = [data]
+    for key in (
+        "pow",
+        "proof_of_work",
+        "proofOfWork",
+        "challenge",
+        "data",
+        "requirements",
+        "result",
+        "token",
+    ):
+        nested = data.get(key)
+        if isinstance(nested, dict):
+            candidates.append(nested)
+
+    for candidate in candidates:
+        seed = str(
+            candidate.get("seed")
+            or candidate.get("s")
+            or candidate.get("challenge_seed")
+            or ""
+        ).strip()
+        difficulty = _normalize_pow_difficulty(
+            candidate.get("difficulty")
+            or candidate.get("d")
+            or candidate.get("target")
+            or candidate.get("threshold")
+        )
+        if seed and difficulty:
+            return {
+                "seed": seed,
+                "difficulty": difficulty,
+                "raw": candidate,
+            }
+    return {}
+
+
+def solve_sentinel_pow(seed: str, difficulty: str, *, max_nonce: int = 500000) -> str:
+    target = _normalize_pow_difficulty(difficulty)
+    if not seed or not target:
+        return ""
+
+    probe = {"n": 0}
+    target_len = len(target)
+    for nonce in range(max_nonce):
+        probe["n"] = nonce
+        payload = json.dumps(probe, separators=(",", ":"), ensure_ascii=False)
+        candidate = _fnv1a_hex(seed + payload)
+        if len(candidate) == target_len and candidate <= target:
+            return f"gAAAAAB{nonce}"
+    return ""
+
+
+def get_sentinel_pow_token(
+    session: requests.Session,
+    did: str,
+    flow: str,
+    *,
+    timeout: int = 15,
+) -> str:
+    if not did or not flow:
+        return ""
+
+    common_headers = {
+        "origin": SENTINEL_BASE,
+        "referer": SENTINEL_FRAME_URL,
+        "content-type": "text/plain;charset=UTF-8",
+        "accept": "application/json, text/plain, */*",
+    }
+
+    challenge_body = json.dumps({"id": did, "flow": flow}, separators=(",", ":"))
+    try:
+        challenge_resp = session.post(
+            SENTINEL_POW_CHALLENGE_URL,
+            headers=common_headers,
+            data=challenge_body,
+            impersonate="chrome",
+            timeout=timeout,
+        )
+    except Exception as e:
+        log_error(f"获取 Sentinel POW challenge 失败: {e}")
+        return ""
+
+    if challenge_resp.status_code != 200:
+        log_error(
+            f"Sentinel POW challenge 异常，状态码: {challenge_resp.status_code}"
+        )
+        if challenge_resp.text:
+            log_error_detail(challenge_resp.text[:500])
+        return ""
+
+    try:
+        challenge_data = challenge_resp.json()
+    except Exception as e:
+        log_error(f"解析 Sentinel POW challenge 失败: {e}")
+        log_error_detail(challenge_resp.text[:500])
+        return ""
+
+    pow_params = _extract_pow_params(challenge_data)
+    if not pow_params:
+        log_error("Sentinel POW challenge 响应中缺少 seed/difficulty")
+        log_error_detail(json.dumps(challenge_data, ensure_ascii=False)[:800])
+        return ""
+
+    pow_token = solve_sentinel_pow(pow_params["seed"], pow_params["difficulty"])
+    if not pow_token:
+        log_error("Sentinel POW 求解失败")
+        return ""
+
+    verify_payload = {
+        "id": did,
+        "flow": flow,
+        "seed": pow_params["seed"],
+        "difficulty": pow_params["difficulty"],
+        "solution": pow_token,
+        "token": pow_token,
+        "proof": pow_token,
+    }
+
+    try:
+        verify_resp = session.post(
+            SENTINEL_POW_VERIFY_URL,
+            headers=common_headers,
+            data=json.dumps(verify_payload, separators=(",", ":")),
+            impersonate="chrome",
+            timeout=timeout,
+        )
+    except Exception as e:
+        log_error(f"Sentinel POW verify 请求失败: {e}")
+        return ""
+
+    if verify_resp.status_code != 200:
+        log_error(f"Sentinel POW verify 异常，状态码: {verify_resp.status_code}")
+        if verify_resp.text:
+            log_error_detail(verify_resp.text[:500])
+        return ""
+
+    return pow_token
 
 
 def _post_form(url: str, data: Dict[str, str], timeout: int = 30) -> Dict[str, Any]:
@@ -979,8 +2024,6 @@ def submit_callback_url(
 
 
 def run(proxy: Optional[str], imap_config: Optional[dict] = None, email_provider: str = "mailgw") -> Optional[str]:
-    ui_state.failed_count = getattr(ui_state, "failed_count", 0)
-
     # 自动修补 Proxy 协议缺失
     if proxy and "://" not in proxy:
         if proxy.endswith(":1080"):
@@ -1009,13 +2052,18 @@ def run(proxy: Optional[str], imap_config: Optional[dict] = None, email_provider
         return None
 
     email = ""
-    dev_token = ""
+    dev_token: Any = ""
     is_imap = False
-    
+
     if imap_config:
         email = get_email_imap(imap_config["domain"])
         is_imap = True
         log_info(f"使用自建 IMAP 域名邮箱: {email}")
+    elif email_provider == "domain":
+        email, dev_token = get_domain_email(proxies)
+        if not email or dev_token is None:
+            return None
+        log_info(f"成功获取 Mailfree 域名邮箱: {email}")
     elif email_provider == "1secmail":
         email, dev_token = get_email_1secmail(proxies)
         if not email:
@@ -1036,6 +2084,11 @@ def run(proxy: Optional[str], imap_config: Optional[dict] = None, email_provider
         if not email or not dev_token:
             return None
         log_info(f"成功获取 Mail.tm 邮箱与授权: {email}")
+    elif email_provider == "duckmail":
+        email, dev_token = get_email_and_token(proxies, base_url=DUCKMAIL_BASE)
+        if not email or not dev_token:
+            return None
+        log_info(f"成功获取 DuckMail 邮箱与授权: {email}")
     elif email_provider == "tempmailfree":
         email, dev_token = get_email_temp_mailfree(proxies)
         if not email or not dev_token:
@@ -1054,27 +2107,31 @@ def run(proxy: Optional[str], imap_config: Optional[dict] = None, email_provider
         log_info(f"Device ID: {did}")
 
         signup_body = f'{{"username":{{"value":"{email}","kind":"email"}},"screen_hint":"signup"}}'
-        sen_req_body = f'{{"p":"","id":"{did}","flow":"authorize_continue"}}'
+        log_info("主流程跳过 Sentinel POW challenge，直接使用空 p 请求 sentinel")
+        pow_token = ""
+        sen_req_body = json.dumps({"p": pow_token, "id": did, "flow": "authorize_continue"}, separators=(",", ":"))
 
-        sen_resp = requests.post(
-            "https://sentinel.openai.com/backend-api/sentinel/req",
+        sen_resp = s.post(
+            SENTINEL_REQ_URL,
             headers={
-                "origin": "https://sentinel.openai.com",
-                "referer": "https://sentinel.openai.com/backend-api/sentinel/frame.html?sv=20260219f9f6",
+                "origin": SENTINEL_BASE,
+                "referer": SENTINEL_FRAME_URL,
                 "content-type": "text/plain;charset=UTF-8",
             },
             data=sen_req_body,
-            proxies=proxies,
             impersonate="chrome",
             timeout=15,
         )
 
         if sen_resp.status_code != 200:
             log_error(f"Sentinel 异常拦截，状态码: {sen_resp.status_code}")
+            log_error_detail(sen_resp.text[:400])
             return None
 
         sen_token = sen_resp.json()["token"]
-        sentinel = f'{{"p": "", "t": "", "c": "{sen_token}", "id": "{did}", "flow": "authorize_continue"}}'
+        log_info(f"Sentinel状态: {sen_resp.status_code}")
+        sentinel_payload = {"p": pow_token, "t": "", "c": sen_token, "id": did, "flow": "authorize_continue"}
+        sentinel = json.dumps(sentinel_payload, separators=(",", ":"))
 
         signup_resp = s.post(
             "https://auth.openai.com/api/accounts/authorize/continue",
@@ -1099,8 +2156,8 @@ def run(proxy: Optional[str], imap_config: Optional[dict] = None, email_provider
                 pass
 
         # 设置密码 - 使用正确的 API 端点
-        random_password = secrets.token_urlsafe(16)
-        register_body = f'{{"password":"{random_password}","username":"{email}"}}'
+        account_password = secrets.token_urlsafe(16)
+        register_body = f'{{"password":"{account_password}","username":"{email}"}}'
         
         register_resp = s.post(
             "https://auth.openai.com/api/accounts/user/register",
@@ -1114,7 +2171,8 @@ def run(proxy: Optional[str], imap_config: Optional[dict] = None, email_provider
         log_info(f"注册密码状态: {register_resp.status_code}")
         
         if register_resp.status_code != 200:
-            log_error(f"注册响应: {register_resp.text[:500]}")
+            log_error(f"注册响应: {register_resp.status_code}")
+            log_error_detail(register_resp.text[:500])
             return None
         
         # 检查注册响应
@@ -1140,32 +2198,17 @@ def run(proxy: Optional[str], imap_config: Optional[dict] = None, email_provider
                     },
                 )
                 if otp_resp.status_code != 200:
-                    log_error(f"发送验证码失败: {otp_resp.text[:300]}")
+                    log_error(f"发送验证码失败: {otp_resp.status_code}")
+                    log_error_detail(otp_resp.text[:300])
         except Exception as e:
             log_error(f"处理注册响应失败: {e}")
 
-        if is_imap and imap_config:
-            code = get_oai_code_imap(
-                email, 
-                imap_config["server"], 
-                imap_config["user"], 
-                imap_config["password"]
-            )
-        elif email_provider == "1secmail":
-            code = get_oai_code_1secmail(email, proxies)
-        elif email_provider == "dropmail":
-            code = get_oai_code_dropmail(dev_token, email, proxies)
-        elif email_provider == "mailgw":
-            code = get_oai_code(dev_token, email, proxies, base_url="https://api.mail.gw")
-        elif email_provider == "tempmailfree":
-            code = get_oai_code_temp_mailfree(email, dev_token, proxies)
-        else:
-            code = get_oai_code(dev_token, email, proxies)
-            
-        if not code:
+        first_code = _read_first_otp(email_provider, email, dev_token, proxies, imap_config)
+
+        if not first_code:
             return None
 
-        code_body = f'{{"code":"{code}"}}'
+        code_body = f'{{"code":"{first_code}"}}'
         code_resp = s.post(
             "https://auth.openai.com/api/accounts/email-otp/validate",
             headers={
@@ -1178,7 +2221,8 @@ def run(proxy: Optional[str], imap_config: Optional[dict] = None, email_provider
         log_info(f"验证码校验状态: {code_resp.status_code}")
         
         if code_resp.status_code != 200:
-            log_error(f"验证失败: {code_resp.text[:300]}")
+            log_error(f"验证失败: {code_resp.status_code}")
+            log_error_detail(code_resp.text[:300])
             return None
         
         # 检查验证响应中的 continue_url
@@ -1217,22 +2261,55 @@ def run(proxy: Optional[str], imap_config: Optional[dict] = None, email_provider
             log_error_detail(create_account_resp.text)
             return None
 
-        auth_cookie = s.cookies.get("oai-client-auth-session")
-        if not auth_cookie:
-            log_error("未能获取到授权 Cookie")
+        workspace_context = _build_workspace_context(s, create_account_resp, timeout=15)
+        workspace_id = str(workspace_context.get("workspace_id") or "").strip()
+        branch_name = str(workspace_context.get("branch_name") or "").strip()
+        branch_url = str(workspace_context.get("branch_url") or "").strip()
+        follow_resp = workspace_context.get("follow_resp")
+
+        recovery_result_queue: queue.Queue = queue.Queue(maxsize=1)
+        recovery_stop_event = threading.Event()
+        recovery_thread = None
+
+        if not workspace_id and branch_name in {"add-phone", "verify-your-identity"}:
+            checkpoint = capture_mail_checkpoint(email_provider, email, dev_token, proxies, imap_config)
+            log_info(f"恢复登录邮箱基线: ids={len(checkpoint.ids)} used_codes={len(checkpoint.codes)}")
+            recovery_thread = threading.Thread(
+                target=signin_recovery_flow,
+                kwargs={
+                    "email": email,
+                    "password": account_password,
+                    "dev_token": dev_token,
+                    "proxies": proxies,
+                    "email_provider": email_provider,
+                    "imap_config": imap_config,
+                    "first_code": first_code,
+                    "checkpoint": checkpoint,
+                    "result_queue": recovery_result_queue,
+                    "stop_event": recovery_stop_event,
+                },
+                daemon=True,
+            )
+            log_info(f"命中特定卡页 {branch_name}，启动并行恢复登录流程")
+            recovery_thread.start()
+            recovery_thread.join(timeout=150)
+            if not recovery_result_queue.empty():
+                return recovery_result_queue.get()
+            log_error("恢复登录流程未在超时内取得 token")
             return None
 
-        auth_json = _decode_jwt_segment(auth_cookie.split(".")[0])
-        workspaces = auth_json.get("workspaces") or []
-        if not workspaces:
-            log_error("授权 Cookie 里没有 workspace 信息")
-            return None
-        workspace_id = str((workspaces[0] or {}).get("id") or "").strip()
         if not workspace_id:
-            log_error("无法解析 workspace_id")
+            if follow_resp is not None and branch_name == "add-phone":
+                add_phone_hints = _extract_add_phone_hints(follow_resp.text)
+                if add_phone_hints:
+                    log_error_detail(json.dumps(add_phone_hints, ensure_ascii=False)[:2000])
+            if branch_url:
+                log_error(f"流程卡在页面: {branch_url}")
+            log_error("未能解析 workspace_id")
             return None
 
         select_body = f'{{"workspace_id":"{workspace_id}"}}'
+        log_info(f"主流程准备 workspace/select: workspace_id={workspace_id}")
         select_resp = s.post(
             "https://auth.openai.com/api/accounts/workspace/select",
             headers={
@@ -1247,30 +2324,16 @@ def run(proxy: Optional[str], imap_config: Optional[dict] = None, email_provider
             log_error_detail(select_resp.text)
             return None
 
+        log_info(f"主流程 workspace/select 成功: {select_resp.status_code}")
         continue_url = str((select_resp.json() or {}).get("continue_url") or "").strip()
         if not continue_url:
             log_error("workspace/select 响应里缺少 continue_url")
             return None
 
-        current_url = continue_url
-        for _ in range(6):
-            final_resp = s.get(current_url, allow_redirects=False, timeout=15)
-            location = final_resp.headers.get("Location") or ""
-
-            if final_resp.status_code not in [301, 302, 303, 307, 308]:
-                break
-            if not location:
-                break
-
-            next_url = urllib.parse.urljoin(current_url, location)
-            if "code=" in next_url and "state=" in next_url:
-                return submit_callback_url(
-                    callback_url=next_url,
-                    code_verifier=oauth.code_verifier,
-                    redirect_uri=oauth.redirect_uri,
-                    expected_state=oauth.state,
-                )
-            current_url = next_url
+        log_info(f"主流程 workspace/select continue_url: {continue_url}")
+        token_json = _follow_redirects_to_token(s, continue_url, oauth, timeout=15)
+        if token_json:
+            return token_json
 
         log_error("未能在重定向链中捕获到最终 Callback URL")
         return None
@@ -1287,9 +2350,7 @@ def run(proxy: Optional[str], imap_config: Optional[dict] = None, email_provider
 
 
 def main() -> None:
-    global ui_state, ui_live
-
-    parser = argparse.ArgumentParser(description="OpenAI 自动注册脚本")
+    parser = argparse.ArgumentParser(description="日常脚本")
     parser.add_argument(
         "--proxy", default=None, help="代理地址，如 http://127.0.0.1:7890"
     )
@@ -1303,8 +2364,8 @@ def main() -> None:
     )
     # 临时邮箱服务商
     parser.add_argument(
-        "--email-provider", choices=["dropmail", "mailgw", "mailtm", "1secmail", "tempmailfree"], default="dropmail", 
-        help="使用的临时邮箱 API 提供商，默认为 dropmail"
+        "--email-provider", choices=["domain", "dropmail", "mailgw", "mailtm", "1secmail", "tempmailfree", "duckmail"], default="domain",
+        help="使用的临时邮箱 API 提供商，默认为 domain (Mailfree)"
     )
     # IMAP Catch-All Arguments
     parser.add_argument("--imap-domain", help="IMAP 域名 (如 example.com)")
@@ -1328,70 +2389,58 @@ def main() -> None:
     output_dir = args.output_dir or "codex"
     os.makedirs(output_dir, exist_ok=True)
 
-    ui_state = UIState(started_at=datetime.now())
-    is_ci = not sys.stdout.isatty() or os.getenv("CI") == "true"
-    
-    from contextlib import nullcontext
-    ctx = nullcontext() if is_ci else Live(_render_dashboard(), console=console, screen=True, refresh_per_second=4)
+    started_at = datetime.now()
+    total_count = 0
+    success_count = 0
+    failed_count = 0
 
-    with ctx as live:
-        ui_live = None if is_ci else live
-        
-        if ui_live:
-            _append_round_log("[bold cyan]OpenAI Auto Registrar 已启动[/bold cyan]")
-        else:
-            console.print("[bold cyan]OpenAI Auto Registrar 已启动 (CLI 模式)[/bold cyan]")
+    print("已启动")
 
-        while True:
-            ui_state.total_count += 1
-            ui_state.current_round = ui_state.total_count
-            ui_state.current_round_logs = []
+    while True:
+        total_count += 1
+        current_round = total_count
 
-            try:
-                log_panel(
-                    f"开始第 {ui_state.current_round} 次注册流程",
-                    f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-                    border_style="bright_magenta",
+        try:
+            log_panel(
+                f"开始第 {current_round} 次注册流程",
+                f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                border_style="bright_magenta",
+            )
+            token_json = run(args.proxy, imap_config=imap_config, email_provider=args.email_provider)
+
+            if token_json:
+                try:
+                    t_data = json.loads(token_json)
+                    fname_email = t_data.get("email", "unknown").replace("@", "_")
+                except Exception:
+                    fname_email = "unknown"
+
+                file_name = os.path.join(
+                    output_dir, f"token_{fname_email}_{int(time.time())}.json"
                 )
-                token_json = run(args.proxy, imap_config=imap_config, email_provider=args.email_provider)
 
-                if token_json:
-                    try:
-                        t_data = json.loads(token_json)
-                        fname_email = t_data.get("email", "unknown").replace("@", "_")
-                    except Exception:
-                        fname_email = "unknown"
+                with open(file_name, "w", encoding="utf-8") as f:
+                    f.write(token_json)
 
-                    file_name = os.path.join(
-                        output_dir, f"token_{fname_email}_{int(time.time())}.json"
-                    )
+                success_count += 1
+                log_success(f"注册成功，Token 已保存: {file_name}")
+            else:
+                failed_count += 1
+                log_error("本次注册失败，未产出 token")
 
-                    with open(file_name, "w", encoding="utf-8") as f:
-                        f.write(token_json)
+        except Exception as e:
+            failed_count += 1
+            log_error(f"发生未捕获异常: {e}")
 
-                    ui_state.success_count += 1
-                    if ui_state.saved_files is None:
-                        ui_state.saved_files = []
-                    ui_state.saved_files.append(file_name)
-                    if len(ui_state.saved_files) > 100:
-                        ui_state.saved_files = ui_state.saved_files[-100:]
-                    log_success(f"注册成功，Token 已保存: {file_name}")
-                else:
-                    ui_state.failed_count += 1
-                    log_error("本次注册失败，未产出 token")
+        elapsed = datetime.now() - started_at
+        print(f"统计: 成功 {success_count} / 总数 {total_count} / 失败 {failed_count} | 耗时: {elapsed}")
 
-            except Exception as e:
-                ui_state.failed_count += 1
-                log_error(f"发生未捕获异常: {e}")
+        if args.once:
+            break
 
-            if args.once:
-                break
-
-            wait_time = random.randint(sleep_min, sleep_max)
-            log_info(f"休息 {wait_time} 秒...")
-            time.sleep(wait_time)
-
-        ui_live = None
+        wait_time = random.randint(sleep_min, sleep_max)
+        log_info(f"休息 {wait_time} 秒...")
+        time.sleep(wait_time)
 
 
 if __name__ == "__main__":
